@@ -409,6 +409,8 @@ def process_pending_jobs() -> None:
             continue
         attempts = _read_pending_attempts(txt_path)
         if attempts >= MAX_ATTEMPTS:
+            # Max attempts reached: send a one-line failure notice, but KEEP the original
+            # .request.json so jobs can be re-run or inspected later.
             try:
                 with open(req_path) as f:
                     req = json.load(f)
@@ -421,10 +423,7 @@ def process_pending_jobs() -> None:
                 shutil.move(txt_path, os.path.join(OUTPUTS_DIR, f"{job_id}.failed.txt"))
             except Exception:
                 pass
-            try:
-                os.remove(req_path)
-            except Exception:
-                pass
+            # Intentionally do NOT delete req_path; leave it in pending/ for manual replay/debug.
             continue
         _update_pending_attempts(txt_path, attempts + 1)
         try:
@@ -594,8 +593,8 @@ def _predict_hke_assembly_multichain(sequences: list[str]) -> str:
         hke_max_iter_s1=HKE_MAX_ITER[0],
         hke_max_iter_s2=HKE_MAX_ITER[1],
         hke_max_iter_s3=HKE_MAX_ITER[2],
-        converge_max_disp_per_100_res=0.5,
-        max_dock_iter=2000,
+        converge_max_disp_per_100_res=1.0,
+        max_dock_iter=600,
     )
     chain_lengths = [len(seqs[0]), len(seqs[1])]
     for i in range(2, len(seqs)):
@@ -614,8 +613,8 @@ def _predict_hke_assembly_multichain(sequences: list[str]) -> str:
         _, _, result_ab = run_two_chain_assembly(
             result_combined,
             result_c,
-            max_dock_iter=2000,
-            converge_max_disp_per_100_res=0.5,
+            max_dock_iter=600,
+            converge_max_disp_per_100_res=1.0,
         )
         chain_lengths.append(len(seqs[i]))
     # Split result_ab: backbone_chain_a = all but last chain, backbone_chain_b = last chain
@@ -665,8 +664,8 @@ def _predict_hke_assembly_with_complex(sequences: list[str]) -> tuple[str, str, 
         hke_max_iter_s1=HKE_MAX_ITER[0],
         hke_max_iter_s2=HKE_MAX_ITER[1],
         hke_max_iter_s3=HKE_MAX_ITER[2],
-        converge_max_disp_per_100_res=0.5,
-        max_dock_iter=2000,
+        converge_max_disp_per_100_res=1.0,
+        max_dock_iter=600,
     )
     pdb_a = full_chain_to_pdb(result_a, chain_id="A")
     pdb_b = full_chain_to_pdb(result_b, chain_id="B")
@@ -699,7 +698,7 @@ def _predict_cartesian_assembly_with_complex(sequences: list[str]) -> tuple[str,
         seq_b, max_iter=100, long_chain_max_iter=80, include_sidechains=False
     )
     result_a, result_b, result_complex = run_two_chain_assembly(
-        result_a, result_b, max_dock_iter=60, converge_max_disp_per_100_res=0.5
+        result_a, result_b, max_dock_iter=60, converge_max_disp_per_100_res=1.0
     )
     pdb_a = full_chain_to_pdb(result_a, chain_id="A")
     pdb_b = full_chain_to_pdb(result_b, chain_id="B")
