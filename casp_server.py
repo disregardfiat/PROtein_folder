@@ -283,6 +283,84 @@ def _send_pdb_email(to_email: str, pdb: str, title: str | None) -> None:
         app.logger.warning("SMTP send failed: %s", e)
 
 
+def _send_pdb_email_custom(
+    to_email: str,
+    pdb: str,
+    title: str | None,
+    filename: str,
+) -> None:
+    """Send a single PDB with a custom attachment filename."""
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
+        return
+    subject = f"HQIV prediction: {title}" if title else "HQIV structure prediction"
+    msg = MIMEMultipart()
+    msg["Subject"] = subject
+    from_addr = _smtp_from_address()
+    msg["From"] = formataddr(("HQIV CASP Server", from_addr))
+    msg["To"] = to_email
+    recipients = [to_email]
+    if SMTP_CC_TO and re.match(r"[^@]+@[^@]+\.[^@]+", SMTP_CC_TO):
+        cc_addr = SMTP_CC_TO.strip().lower()
+        to_addr_lower = to_email.strip().lower()
+        if cc_addr != to_addr_lower:
+            msg["Cc"] = SMTP_CC_TO
+            recipients.append(SMTP_CC_TO)
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain="casp.disregardfiat.tech")
+    msg.attach(MIMEText("PDB model attached (CASP format).", "plain"))
+    part = MIMEText(pdb, "plain")
+    part.add_header("Content-Disposition", "attachment", filename=filename)
+    msg.attach(part)
+    try:
+        import smtplib
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as smtp:
+            if SMTP_USE_TLS:
+                smtp.starttls()
+            smtp.login(SMTP_USER, SMTP_PASSWORD)
+            smtp.sendmail(from_addr, recipients, msg.as_string())
+    except Exception as e:
+        app.logger.warning("SMTP send failed: %s", e)
+
+
+def _send_pdb_email_multi(
+    to_email: str,
+    models: list[tuple[str, str]],
+    title: str | None,
+) -> None:
+    """Send multiple PDB models as separate attachments."""
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
+        return
+    subject = f"HQIV prediction: {title}" if title else "HQIV structure prediction"
+    msg = MIMEMultipart()
+    msg["Subject"] = subject
+    from_addr = _smtp_from_address()
+    msg["From"] = formataddr(("HQIV CASP Server", from_addr))
+    msg["To"] = to_email
+    recipients = [to_email]
+    if SMTP_CC_TO and re.match(r"[^@]+@[^@]+\.[^@]+", SMTP_CC_TO):
+        cc_addr = SMTP_CC_TO.strip().lower()
+        to_addr_lower = to_email.strip().lower()
+        if cc_addr != to_addr_lower:
+            msg["Cc"] = SMTP_CC_TO
+            recipients.append(SMTP_CC_TO)
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain="casp.disregardfiat.tech")
+    msg.attach(MIMEText("PDB models attached (CASP format).", "plain"))
+    for filename, pdb in models:
+        part = MIMEText(pdb, "plain")
+        part.add_header("Content-Disposition", "attachment", filename=filename)
+        msg.attach(part)
+    try:
+        import smtplib
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as smtp:
+            if SMTP_USE_TLS:
+                smtp.starttls()
+            smtp.login(SMTP_USER, SMTP_PASSWORD)
+            smtp.sendmail(from_addr, recipients, msg.as_string())
+    except Exception as e:
+        app.logger.warning("SMTP send failed: %s", e)
+
+
 def _send_assembly_email(
     to_email: str,
     pdb_complex: str,
@@ -376,6 +454,153 @@ def _update_pending_attempts(txt_path: str, attempts: int) -> None:
         f.writelines(lines)
 
 
+def _run_fast_pass(sequences: list[str], seqs: list[str]) -> str:
+    """
+    Fast-pass prediction: inexpensive geometry-only or hierarchical shortcut.
+    Uses hqiv_predict_structure(_assembly) when available; otherwise falls back
+    to a single hierarchical pass.
+    Returns a PDB string (single or multi-chain).
+    """
+    if hqiv_predict_structure is not None:
+        if len(seqs) > 1 and hqiv_predict_structure_assembly is not None:
+            return hqiv_predict_structure_assembly(sequences)
+        return hqiv_predict_structure(seqs[0])
+    # Fallback: lightweight hierarchical run
+    if len(seqs) > 1:
+        # Fold each chain quickly and merge without docking
+        chain_ids = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        results = []
+        for i, seq in enumerate(seqs):
+            pos, z_list = minimize_full_chain_hierarchical(
+                seq,
+                include_sidechains=False,
+                funnel_radius=FUNNEL_RADIUS,
+                funnel_stiffness=1.0,
+                funnel_radius_exit=FUNNEL_RADIUS_EXIT,
+                max_iter_stage1=max(5, HKE_MAX_ITER[0] // 2),
+                max_iter_stage2=max(10, HKE_MAX_ITER[1] // 2),
+                max_iter_stage3=max(10, HKE_MAX_ITER[2] // 2),
+            )
+            result = hierarchical_result_for_pdb(pos, z_list, seq, include_sidechains=False)
+            cid = chain_ids[i] if i < len(chain_ids) else "A"
+            results.append((result, cid))
+        return _merge_pdb_chains(results)
+    # Single-chain quick hierarchical
+    pos, z_list = minimize_full_chain_hierarchical(
+        seqs[0],
+        include_sidechains=False,
+        funnel_radius=FUNNEL_RADIUS,
+        funnel_stiffness=1.0,
+        funnel_radius_exit=FUNNEL_RADIUS_EXIT,
+        max_iter_stage1=max(5, HKE_MAX_ITER[0] // 2),
+        max_iter_stage2=max(10, HKE_MAX_ITER[1] // 2),
+        max_iter_stage3=max(10, HKE_MAX_ITER[2] // 2),
+    )
+    result = hierarchical_result_for_pdb(pos, z_list, seqs[0], include_sidechains=False)
+    return full_chain_to_pdb(result, chain_id="A")
+
+
+def _run_full_job_pipelines(
+    job_id: str,
+    sequences: list[str],
+    seqs: list[str],
+    to_email: str | None,
+    job_title: str | None,
+    parsed_ligands: list,
+) -> None:
+    """
+    For a given job: run fast-pass first (send fast email), then full HKE pipeline.
+    Writes both fast and HKE PDBs to disk and records model metadata.
+    """
+    # 1) Fast-pass
+    fast_pdb = _run_fast_pass(sequences, seqs)
+    fast_filename = "Prediction1.pdb"
+    if to_email:
+        _send_pdb_email_custom(to_email, fast_pdb, job_title, filename=fast_filename)
+    # Persist fast-pass PDB beside pending job
+    fast_path = os.path.join(PENDING_DIR, f"{job_id}.fast.pdb")
+    with open(fast_path, "w") as f:
+        f.write(fast_pdb)
+
+    # If USE_FAST_PREDICT is set, skip HKE and treat fast-pass as final
+    if USE_FAST_PREDICT and hqiv_predict_structure is not None:
+        _move_to_outputs(job_id, fast_pdb)
+        # Also move fast-pass copy into outputs
+        out_fast = os.path.join(OUTPUTS_DIR, f"{job_id}.fast.pdb")
+        try:
+            shutil.move(fast_path, out_fast)
+        except Exception:
+            pass
+        return
+
+    # 2) Full HKE pipeline (single or multi-chain, with assembly/multichain as needed)
+    if len(seqs) == 2:
+        assembly = None
+        try:
+            assembly = _predict_hke_assembly_with_complex(sequences)
+        except Exception as e:
+            app.logger.warning("HKE 2-chain failed, falling back to Cartesian: %s", e)
+            assembly = _predict_cartesian_assembly_with_complex(sequences)
+        if assembly is not None:
+            _pdb_a, _pdb_b, pdb_complex = assembly
+            hke_pdb = pdb_complex
+        else:
+            hke_pdb = _predict_hke_assembly(seqs)
+    elif len(seqs) >= 3:
+        hke_pdb = _predict_hke_assembly_multichain(sequences)
+    else:
+        hke_pdb = _predict_hke_single(seqs[0], ligands=parsed_ligands if parsed_ligands else None)
+
+    # Move main HKE PDB + bookkeeping via existing helper
+    _move_to_outputs(job_id, hke_pdb)
+
+    # After move_to_outputs, pending/{job_id}.pdb is now in outputs/; move fast-pass too
+    out_fast = os.path.join(OUTPUTS_DIR, f"{job_id}.fast.pdb")
+    try:
+        if os.path.isfile(fast_path):
+            shutil.move(fast_path, out_fast)
+    except Exception:
+        pass
+
+    # Record models.json in outputs
+    models_path = os.path.join(OUTPUTS_DIR, f"{job_id}.models.json")
+    try:
+        record = {
+            "job_id": job_id,
+            "title": job_title,
+            "email": to_email,
+            "models": [
+                {
+                    "name": "Prediction1.pdb",
+                    "stage": "hke",
+                    "type": "hke",
+                    "file": f"{job_id}.pdb",
+                },
+                {
+                    "name": "Prediction2.pdb",
+                    "stage": "fast",
+                    "type": "fast",
+                    "file": f"{job_id}.fast.pdb",
+                },
+            ],
+        }
+        with open(models_path, "w") as f:
+            json.dump(record, f)
+    except Exception as e:
+        app.logger.warning("Failed to write models.json for job %s: %s", job_id, e)
+
+    # 3) Second email: HKE as Prediction1.pdb, fast-pass as Prediction2.pdb
+    if to_email:
+        _send_pdb_email_multi(
+            to_email,
+            models=[
+                ("Prediction1.pdb", hke_pdb),
+                ("Prediction2.pdb", fast_pdb),
+            ],
+            title=job_title,
+        )
+
+
 def process_pending_jobs() -> None:
     """Run once on startup: for each pending job without .pdb, retry once or send failure email after MAX_ATTEMPTS."""
     _ensure_output_dirs()
@@ -446,38 +671,14 @@ def process_pending_jobs() -> None:
                 len(parsed_ligands),
             )
         try:
-            if USE_FAST_PREDICT and hqiv_predict_structure is not None:
-                pdb = hqiv_predict_structure_assembly(sequences) if len(seqs) > 1 else hqiv_predict_structure(sequences[0])
-                _move_to_outputs(job_id, pdb)
-                if to_email:
-                    _send_pdb_email(to_email, pdb, job_title)
-            elif len(seqs) == 2:
-                assembly = None
-                try:
-                    assembly = _predict_hke_assembly_with_complex(sequences)
-                except Exception as e:
-                    app.logger.warning("HKE 2-chain failed (pending), falling back to Cartesian: %s", e)
-                    assembly = _predict_cartesian_assembly_with_complex(sequences)
-                if assembly is not None:
-                    pdb_a, pdb_b, pdb_complex = assembly
-                    _move_to_outputs_assembly(job_id, pdb_complex)
-                    if to_email:
-                        _send_assembly_email(to_email, pdb_complex, job_title)
-                else:
-                    pdb = _predict_hke_assembly(seqs)
-                    _move_to_outputs(job_id, pdb)
-                    if to_email:
-                        _send_pdb_email(to_email, pdb, job_title)
-            else:
-                if len(seqs) >= 3:
-                    pdb = _predict_hke_assembly_multichain(sequences)
-                elif len(seqs) > 1:
-                    pdb = _predict_hke_assembly(seqs)
-                else:
-                    pdb = _predict_hke_single(seqs[0], ligands=parsed_ligands if parsed_ligands else None)
-                _move_to_outputs(job_id, pdb)
-                if to_email:
-                    _send_pdb_email(to_email, pdb, job_title)
+            _run_full_job_pipelines(
+                job_id=job_id,
+                sequences=sequences,
+                seqs=seqs,
+                to_email=to_email,
+                job_title=job_title,
+                parsed_ligands=parsed_ligands,
+            )
         except Exception as e:
             app.logger.warning("Pending job %s retry failed: %s", job_id, e)
             if to_email and re.match(r"[^@]+@[^@]+\.[^@]+", to_email):
