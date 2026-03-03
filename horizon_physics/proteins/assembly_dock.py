@@ -28,6 +28,7 @@ from .folding_energy import (
     K_CLASH,
 )
 from .gradient_descent_folding import _project_bonds
+from .surface_attachment import find_attachment_point, ATTACHMENT_CONTACT_DIST
 
 try:
     from scipy.spatial import cKDTree
@@ -133,6 +134,58 @@ def _rotation_matrix_axis_angle(axis: np.ndarray, angle_rad: float) -> np.ndarra
     ])
 
 
+def _place_two_chains_attachment_guided(
+    ca_a: np.ndarray,
+    ca_b: np.ndarray,
+    d_contact: float = ATTACHMENT_CONTACT_DIST,
+) -> Tuple[np.ndarray, np.ndarray] | None:
+    """
+    Place B using surface attachment points: align B's best attachment toward A's.
+    Returns (ca_a, ca_b_placed) or None if attachment analysis fails (degenerate).
+    """
+    if np.any(np.abs(ca_a) > 1e6) or np.any(np.abs(ca_b) > 1e6):
+        return None  # Bad input scale; fall back to grid search
+    n_a, n_b = ca_a.shape[0], ca_b.shape[0]
+    z_a = np.full(n_a, 6)
+    z_b = np.full(n_b, 6)
+    pos_a, dir_a, _ = find_attachment_point(ca_a, z_a)
+    pos_b, dir_b, _ = find_attachment_point(ca_b, z_b)
+    dir_a = np.asarray(dir_a, dtype=float)
+    dir_b = np.asarray(dir_b, dtype=float)
+    if np.linalg.norm(dir_a) < 1e-9:
+        dir_a = np.array([1.0, 0.0, 0.0])
+    else:
+        dir_a = dir_a / np.linalg.norm(dir_a)
+    if np.linalg.norm(dir_b) < 1e-9:
+        dir_b = np.array([1.0, 0.0, 0.0])
+    else:
+        dir_b = dir_b / np.linalg.norm(dir_b)
+    # Rotate B so dir_b → -dir_a (B's outward points toward A)
+    target = -dir_a
+    axis = np.cross(dir_b, target)
+    axis_norm = np.linalg.norm(axis)
+    if axis_norm < 1e-9:
+        # dir_b parallel to target; use 180° around perpendicular
+        if np.abs(np.dot(dir_b, target)) > 0.99:
+            axis = np.array([1.0, 0.0, 0.0]) if abs(dir_b[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+            axis = axis - np.dot(axis, dir_b) * dir_b
+            axis_norm = np.linalg.norm(axis)
+        if axis_norm < 1e-9:
+            return None
+    axis = axis / axis_norm
+    angle = np.arccos(np.clip(np.dot(dir_b, target), -1.0, 1.0))
+    R = _rotation_matrix_axis_angle(axis, angle)
+    com_b = np.mean(ca_b, axis=0)
+    ca_b_centered = ca_b - com_b
+    pos_b_rel = pos_b - com_b
+    ca_b_rot = (R @ ca_b_centered.T).T
+    pos_b_rot = R @ pos_b_rel
+    # Translate so B's attachment point is at pos_a + dir_a * d_contact
+    trans = pos_a + dir_a * d_contact - pos_b_rot
+    ca_b_placed = ca_b_rot + trans
+    return ca_a.copy(), ca_b_placed
+
+
 def place_two_chains(
     ca_a: np.ndarray,
     ca_b: np.ndarray,
@@ -140,17 +193,42 @@ def place_two_chains(
     n_translations: int = N_TRANSLATIONS,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Place chain B relative to chain A by searching rotations and COM distances.
-    A stays fixed; B is rotated and translated so COM(B) lies along a direction
-    from COM(A), at a distance in [DOCK_COM_MIN, DOCK_COM_MAX]. Best pose = max contacts, min clashes.
+    Place chain B relative to chain A. Uses surface attachment analysis (O(n)):
+    finds exposed-surface bonding hotspots from horizon φ, aligns B's best
+    attachment toward A's, then refines with contact/clash scoring.
+    Falls back to grid search if attachment-guided placement fails.
     Returns (ca_a_placed, ca_b_placed) with A unchanged and B placed.
     """
+    # 1) Try attachment-guided placement
+    result = _place_two_chains_attachment_guided(ca_a, ca_b)
+    if result is not None:
+        ca_a_fixed, ca_b_placed = result
+        n_contact, n_clash = _contact_clash_score(ca_a_fixed, ca_b_placed)
+        if n_clash == 0 or n_contact > 0:
+            # Refine: small rotations around attachment axis
+            pos_a, dir_a, _ = find_attachment_point(ca_a, np.full(ca_a.shape[0], 6))
+            com_b = np.mean(ca_b_placed, axis=0)
+            ca_b_centered = ca_b_placed - com_b
+            best_b = ca_b_placed.copy()
+            best_score = n_contact - 10.0 * n_clash
+            for twist in range(12):
+                angle = 2 * np.pi * twist / 12
+                R = _rotation_matrix_axis_angle(dir_a, angle)
+                b_twist = (R @ ca_b_centered.T).T + com_b
+                nc, ncl = _contact_clash_score(ca_a_fixed, b_twist)
+                sc = nc - 10.0 * ncl
+                if sc > best_score:
+                    best_score = sc
+                    best_b = b_twist.copy()
+            return ca_a_fixed, best_b
+        return ca_a_fixed, ca_b_placed
+
+    # 2) Fallback: original grid search
     com_a = np.mean(ca_a, axis=0)
     com_b = np.mean(ca_b, axis=0)
     ca_b_centered = ca_b - com_b
     best_score = -1e9
     best_b = ca_b.copy()
-    # Directions from A: sample on a coarse sphere (or along principal axis + random)
     np.random.seed(42)
     for rot_idx in range(n_rotations):
         angle = 2 * np.pi * rot_idx / n_rotations

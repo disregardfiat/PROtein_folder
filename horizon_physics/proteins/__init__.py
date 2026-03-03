@@ -46,6 +46,9 @@ from .secondary_structure_predictor import (
 )
 from .full_protein_minimizer import minimize_full_chain, full_chain_to_pdb, full_chain_to_pdb_complex, pack_sidechains
 from .grade_folds import ca_rmsd, load_ca_from_pdb, load_ca_and_sequence_from_pdb, kabsch_superpose
+from .surface_attachment import find_attachment_point
+from .em_field_pipeline import Atom, EMField, CoTranslationalAssembler, atoms_to_pdb
+from .tunnel_temperature_pipeline import fold_with_tunnel_temperature
 
 # Optional hierarchical kinematic engine (parallel path)
 try:
@@ -102,6 +105,12 @@ __all__ = [
     "load_ca_from_pdb",
     "load_ca_and_sequence_from_pdb",
     "kabsch_superpose",
+    "find_attachment_point",
+    "Atom",
+    "EMField",
+    "CoTranslationalAssembler",
+    "atoms_to_pdb",
+    "fold_with_tunnel_temperature",
     "minimize_full_chain_hierarchical",
     "grade_trajectory",
     "load_trajectory_frames",

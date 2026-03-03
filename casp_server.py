@@ -50,6 +50,10 @@ from horizon_physics.proteins.assembly_dock import (
     run_two_chain_assembly_hke,
     complex_to_single_chain_result,
 )
+try:
+    from horizon_physics.proteins.temperature_path_search import run_discrete_refinement
+except Exception:
+    run_discrete_refinement = None  # pyhqiv or deps missing; skip tree-torque
 
 # Fast path (geometric-only, no minimization): for testing or when USE_FAST_PREDICT=1
 try:
@@ -456,16 +460,11 @@ def _update_pending_attempts(txt_path: str, attempts: int) -> None:
 
 def _run_fast_pass(sequences: list[str], seqs: list[str]) -> str:
     """
-    Fast-pass prediction: inexpensive geometry-only or hierarchical shortcut.
-    Uses hqiv_predict_structure(_assembly) when available; otherwise falls back
-    to a single hierarchical pass.
+    Fast-pass prediction: lightweight hierarchical run (compact folds).
+    Uses funnel-constrained minimization with reduced iterations.
+    Avoids hqiv geometric placement (extended rods) and ensures chains are offset when merged.
     Returns a PDB string (single or multi-chain).
     """
-    if hqiv_predict_structure is not None:
-        if len(seqs) > 1 and hqiv_predict_structure_assembly is not None:
-            return hqiv_predict_structure_assembly(sequences)
-        return hqiv_predict_structure(seqs[0])
-    # Fallback: lightweight hierarchical run
     if len(seqs) > 1:
         # Fold each chain quickly and merge without docking
         chain_ids = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -500,7 +499,26 @@ def _run_fast_pass(sequences: list[str], seqs: list[str]) -> str:
     return full_chain_to_pdb(result, chain_id="A")
 
 
-def _run_full_job_pipelines(
+def _run_fast_pass_only(
+    job_id: str,
+    sequences: list[str],
+    seqs: list[str],
+    to_email: str | None,
+    job_title: str | None,
+) -> None:
+    """
+    Run fast-pass only: write .fast.pdb, send first email. Does NOT increment attempts.
+    Used by process_pending_jobs Phase 1 to give everyone a quick result.
+    """
+    fast_pdb = _run_fast_pass(sequences, seqs)
+    fast_path = os.path.join(PENDING_DIR, f"{job_id}.fast.pdb")
+    with open(fast_path, "w") as f:
+        f.write(fast_pdb)
+    if to_email:
+        _send_pdb_email_custom(to_email, fast_pdb, job_title, filename="Prediction1.pdb")
+
+
+def _run_hke_only(
     job_id: str,
     sequences: list[str],
     seqs: list[str],
@@ -509,31 +527,24 @@ def _run_full_job_pipelines(
     parsed_ligands: list,
 ) -> None:
     """
-    For a given job: run fast-pass first (send fast email), then full HKE pipeline.
-    Writes both fast and HKE PDBs to disk and records model metadata.
+    Run HKE pipeline only. Assumes .fast.pdb exists in pending.
+    On success: move to outputs, send second email (HKE + fast).
+    On failure: raises (caller sends fast-pass so user gets at least some result).
     """
-    # 1) Fast-pass
-    fast_pdb = _run_fast_pass(sequences, seqs)
-    fast_filename = "Prediction1.pdb"
-    if to_email:
-        _send_pdb_email_custom(to_email, fast_pdb, job_title, filename=fast_filename)
-    # Persist fast-pass PDB beside pending job
     fast_path = os.path.join(PENDING_DIR, f"{job_id}.fast.pdb")
-    with open(fast_path, "w") as f:
-        f.write(fast_pdb)
+    with open(fast_path) as f:
+        fast_pdb = f.read()
 
-    # If USE_FAST_PREDICT is set, skip HKE and treat fast-pass as final
+    # If USE_FAST_PREDICT, treat fast-pass as final (no HKE)
     if USE_FAST_PREDICT and hqiv_predict_structure is not None:
         _move_to_outputs(job_id, fast_pdb)
-        # Also move fast-pass copy into outputs
-        out_fast = os.path.join(OUTPUTS_DIR, f"{job_id}.fast.pdb")
         try:
-            shutil.move(fast_path, out_fast)
+            shutil.move(fast_path, os.path.join(OUTPUTS_DIR, f"{job_id}.fast.pdb"))
         except Exception:
             pass
         return
 
-    # 2) Full HKE pipeline (single or multi-chain, with assembly/multichain as needed)
+    # Full HKE pipeline (single or multi-chain)
     if len(seqs) == 2:
         assembly = None
         try:
@@ -601,22 +612,46 @@ def _run_full_job_pipelines(
         )
 
 
+def _run_full_job_pipelines(
+    job_id: str,
+    sequences: list[str],
+    seqs: list[str],
+    to_email: str | None,
+    job_title: str | None,
+    parsed_ligands: list,
+) -> None:
+    """
+    For a given job: run fast-pass first (send fast email), then full HKE pipeline.
+    Used by _run_job_in_background for new POST jobs.
+    """
+    _run_fast_pass_only(job_id, sequences, seqs, to_email, job_title)
+    _run_hke_only(job_id, sequences, seqs, to_email, job_title, parsed_ligands)
+
+
 def process_pending_jobs() -> None:
-    """Run once on startup: for each pending job without .pdb, retry once or send failure email after MAX_ATTEMPTS."""
+    """
+    Two-phase queue on startup:
+    Phase 1: Run fast-pass for all jobs missing .fast.pdb (quick result for everyone).
+    Phase 2: Run HKE for jobs that have .fast.pdb, ordered by .fast.pdb size (smallest first).
+    On HKE failure: increment attempts; send fast-pass to requester so they get at least some result.
+    """
     _ensure_output_dirs()
     if not os.path.isdir(PENDING_DIR):
         return
+
+    # Collect valid jobs: have .txt and .request.json, no outputs .pdb
+    jobs: list[dict] = []
     for name in os.listdir(PENDING_DIR):
         if not name.endswith(".txt") or name.endswith(".failed.txt"):
             continue
         job_id = name[:-4]
         txt_path = os.path.join(PENDING_DIR, f"{job_id}.txt")
         req_path = os.path.join(PENDING_DIR, f"{job_id}.request.json")
-        pdb_path = os.path.join(PENDING_DIR, f"{job_id}.pdb")
-        if os.path.isfile(pdb_path):
-            continue
+        out_pdb = os.path.join(OUTPUTS_DIR, f"{job_id}.pdb")
+        if os.path.isfile(out_pdb):
+            continue  # Already done
         if not os.path.isfile(req_path):
-            # Legacy: .txt only (no .request.json) — can't retry; send failure if email in .txt
+            # Legacy: .txt only — can't retry
             try:
                 with open(txt_path) as f:
                     for line in f:
@@ -632,25 +667,6 @@ def process_pending_jobs() -> None:
             except Exception:
                 pass
             continue
-        attempts = _read_pending_attempts(txt_path)
-        if attempts >= MAX_ATTEMPTS:
-            # Max attempts reached: send a one-line failure notice, but KEEP the original
-            # .request.json so jobs can be re-run or inspected later.
-            try:
-                with open(req_path) as f:
-                    req = json.load(f)
-                to_email = (req.get("email") or "").strip()
-                if to_email and re.match(r"[^@]+@[^@]+\.[^@]+", to_email):
-                    _send_failure_email(to_email, job_id, req.get("title"))
-            except Exception as e:
-                app.logger.warning("Pending job %s failure-email error: %s", job_id, e)
-            try:
-                shutil.move(txt_path, os.path.join(OUTPUTS_DIR, f"{job_id}.failed.txt"))
-            except Exception:
-                pass
-            # Intentionally do NOT delete req_path; leave it in pending/ for manual replay/debug.
-            continue
-        _update_pending_attempts(txt_path, attempts + 1)
         try:
             with open(req_path) as f:
                 req = json.load(f)
@@ -660,29 +676,81 @@ def process_pending_jobs() -> None:
         seqs = [_sequence_from_input(s) for s in sequences if s]
         if not seqs:
             continue
+        attempts = _read_pending_attempts(txt_path)
         to_email = (req.get("email") or "").strip()
         job_title = req.get("title")
         ligand_str = (req.get(LIGAND_KEY) or "").strip()
         parsed_ligands = parse_ligands(ligand_str) if ligand_str else []
-        if parsed_ligands:
+        jobs.append({
+            "job_id": job_id,
+            "txt_path": txt_path,
+            "req_path": req_path,
+            "sequences": sequences,
+            "seqs": seqs,
+            "to_email": to_email,
+            "job_title": job_title,
+            "parsed_ligands": parsed_ligands,
+            "attempts": attempts,
+        })
+
+    # Handle max-attempts jobs: send failure to CC, move .txt to failed (fast-pass already sent in Phase 1)
+    for j in jobs:
+        if j["attempts"] >= MAX_ATTEMPTS:
+            _send_failure_email(j["to_email"], j["job_id"], j["job_title"])
+            try:
+                shutil.move(j["txt_path"], os.path.join(OUTPUTS_DIR, f"{j['job_id']}.failed.txt"))
+            except Exception:
+                pass
+    jobs = [j for j in jobs if j["attempts"] < MAX_ATTEMPTS]
+
+    # Phase 1: Run fast-pass for jobs missing .fast.pdb (no attempt increment)
+    for j in jobs:
+        fast_path = os.path.join(PENDING_DIR, f"{j['job_id']}.fast.pdb")
+        if not os.path.isfile(fast_path):
+            if j["parsed_ligands"]:
+                app.logger.info(
+                    "Ligand detected via key %s → %d ligands added as 6-DOF agents",
+                    LIGAND_KEY,
+                    len(j["parsed_ligands"]),
+                )
+            try:
+                _run_fast_pass_only(
+                    j["job_id"], j["sequences"], j["seqs"], j["to_email"], j["job_title"]
+                )
+            except Exception as e:
+                app.logger.warning("Pending job %s fast-pass failed: %s", j["job_id"], e)
+
+    # Phase 2: HKE jobs sorted by .fast.pdb size (smallest first = lowest hanging fruit)
+    hke_jobs = []
+    for j in jobs:
+        fast_path = os.path.join(PENDING_DIR, f"{j['job_id']}.fast.pdb")
+        out_pdb = os.path.join(OUTPUTS_DIR, f"{j['job_id']}.pdb")
+        if os.path.isfile(fast_path) and not os.path.isfile(out_pdb):
+            hke_jobs.append((os.path.getsize(fast_path), j))
+    hke_jobs.sort(key=lambda x: x[0])
+
+    for _size, j in hke_jobs:
+        if j["parsed_ligands"]:
             app.logger.info(
                 "Ligand detected via key %s → %d ligands added as 6-DOF agents",
                 LIGAND_KEY,
-                len(parsed_ligands),
+                len(j["parsed_ligands"]),
             )
         try:
-            _run_full_job_pipelines(
-                job_id=job_id,
-                sequences=sequences,
-                seqs=seqs,
-                to_email=to_email,
-                job_title=job_title,
-                parsed_ligands=parsed_ligands,
+            _run_hke_only(
+                j["job_id"], j["sequences"], j["seqs"], j["to_email"], j["job_title"], j["parsed_ligands"]
             )
         except Exception as e:
-            app.logger.warning("Pending job %s retry failed: %s", job_id, e)
-            if to_email and re.match(r"[^@]+@[^@]+\.[^@]+", to_email):
-                _send_job_failure_email(to_email, job_id, job_title, str(e))
+            app.logger.warning("Pending job %s HKE failed: %s", j["job_id"], e)
+            new_attempts = j["attempts"] + 1
+            _update_pending_attempts(j["txt_path"], new_attempts)
+            # Fast-pass already sent in Phase 1; no duplicate email
+            if new_attempts >= MAX_ATTEMPTS:
+                _send_failure_email(j["to_email"], j["job_id"], j["job_title"])
+                try:
+                    shutil.move(j["txt_path"], os.path.join(OUTPUTS_DIR, f"{j['job_id']}.failed.txt"))
+                except Exception:
+                    pass
 
 
 def _sequence_from_input(raw: str) -> str:
@@ -694,7 +762,7 @@ def _sequence_from_input(raw: str) -> str:
 
 
 def _predict_hke_single(sequence: str, ligands: list | None = None) -> str:
-    """Run HKE + funnel for one chain; return PDB string (chain A). If ligands provided, use minimize_full_chain with include_ligands and output HETATM."""
+    """Run HKE + funnel for one chain; then tree-torque refinement (no end flag) until no allowed moves; return PDB (chain A)."""
     if ligands:
         result = minimize_full_chain(
             sequence,
@@ -702,6 +770,19 @@ def _predict_hke_single(sequence: str, ligands: list | None = None) -> str:
             include_ligands=True,
             ligands=ligands,
         )
+        backbone = result.get("backbone_atoms")
+        seq = result.get("sequence", sequence)
+        if run_discrete_refinement and backbone and len(backbone) == 4 * len(seq):
+            try:
+                ref = run_discrete_refinement(
+                    seq,
+                    initial_backbone_atoms=backbone,
+                    run_until_converged=True,
+                    max_phases_cap=100000,
+                )
+                result = {"backbone_atoms": ref.backbone_atoms, "sequence": ref.sequence, "n_res": ref.n_res, "include_sidechains": False, "ligands": result.get("ligands")}
+            except Exception:
+                pass
         return full_chain_to_pdb(result, chain_id="A", ligands=result.get("ligands"))
     pos, z_list = minimize_full_chain_hierarchical(
         sequence,
@@ -714,33 +795,66 @@ def _predict_hke_single(sequence: str, ligands: list | None = None) -> str:
         max_iter_stage3=HKE_MAX_ITER[2],
     )
     result = hierarchical_result_for_pdb(pos, z_list, sequence, include_sidechains=False)
+    backbone = result.get("backbone_atoms")
+    seq = result.get("sequence", sequence)
+    if run_discrete_refinement and backbone and len(backbone) == 4 * len(seq):
+        try:
+            ref = run_discrete_refinement(
+                seq,
+                initial_backbone_atoms=backbone,
+                run_until_converged=True,
+                max_phases_cap=100000,
+            )
+            result = {"backbone_atoms": ref.backbone_atoms, "sequence": ref.sequence, "n_res": ref.n_res, "include_sidechains": False}
+        except Exception:
+            pass
     return full_chain_to_pdb(result, chain_id="A")
 
 
 def _merge_pdb_chains(result_and_chain_ids: list[tuple[dict, str]]) -> str:
-    """Merge multiple (result, chain_id) into one PDB (MODEL 1) with renumbered atom IDs."""
+    """Merge multiple (result, chain_id) into one PDB (MODEL 1) with renumbered atom IDs. Offsets each chain along +x so they don't overlap."""
     from horizon_physics.proteins.casp_submission import AA_1to3
+    import numpy as np
+    chain_gap = 50.0  # Å between chains
+    # First pass: get min_x per chain for offset calculation
+    chain_mins = []
+    for result, _ in result_and_chain_ids:
+        backbone_atoms = result["backbone_atoms"]
+        if not backbone_atoms:
+            chain_mins.append(0.0)
+            continue
+        min_x = min(float(xyz[0]) for _, xyz in backbone_atoms)
+        chain_mins.append(min_x)
     lines = ["MODEL     1"]
     atom_id = 1
-    for result, chain_id in result_and_chain_ids:
+    prev_max_x = float("-inf")
+    for ci, (result, chain_id) in enumerate(result_and_chain_ids):
         backbone_atoms = result["backbone_atoms"]
         sequence = result["sequence"]
         include_sidechains = result.get("include_sidechains", False)
         if not backbone_atoms:
             continue
+        # Offset so this chain's leftmost is to the right of previous chain's rightmost + gap
+        offset_x = max(0.0, prev_max_x + chain_gap - chain_mins[ci])
         idx = 0
+        chain_max_x = float("-inf")
         for res_id in range(1, result["n_res"] + 1):
             res_1 = sequence[res_id - 1]
             res_3 = AA_1to3.get(res_1, "UNK")
             n_atoms_this = (5 if res_1 != "G" else 4) if include_sidechains else 4
             for _ in range(n_atoms_this):
                 name, xyz = backbone_atoms[idx]
+                x = float(xyz[0]) + offset_x
+                y = float(xyz[1])
+                z = float(xyz[2])
+                chain_max_x = max(chain_max_x, x)
                 lines.append(
                     f"ATOM  {atom_id:5d}  {name:2s}  {res_3:3s} {chain_id}{res_id:4d}    "
-                    f"{float(xyz[0]):8.3f}{float(xyz[1]):8.3f}{float(xyz[2]):8.3f}  1.00  0.00           "
+                    f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           "
                 )
                 atom_id += 1
                 idx += 1
+        prev_max_x = chain_max_x
     lines.append("ENDMDL")
     lines.append("END")
     return "\n".join(lines)
@@ -784,7 +898,7 @@ def _predict_hke_assembly_multichain(sequences: list[str]) -> str:
         if assembly is not None:
             return assembly[2]
         return _predict_hke_assembly(sequences)
-    # (A+B)+C pipeline
+    # (A+B)+C pipeline: dock A+B (EM field, connection points), then tree-torque (further from COM first)
     result_a, result_b, result_ab = run_two_chain_assembly_hke(
         seqs[0],
         seqs[1],
@@ -797,6 +911,9 @@ def _predict_hke_assembly_multichain(sequences: list[str]) -> str:
         converge_max_disp_per_100_res=1.0,
         max_dock_iter=600,
     )
+    bb_a, bb_b = _refine_assembly_chains_with_tree_torque(result_ab, seqs[0], seqs[1])
+    result_ab["backbone_chain_a"] = bb_a
+    result_ab["backbone_chain_b"] = bb_b
     chain_lengths = [len(seqs[0]), len(seqs[1])]
     for i in range(2, len(seqs)):
         result_combined = complex_to_single_chain_result(result_ab)
@@ -844,11 +961,42 @@ def _predict_hke_assembly_multichain(sequences: list[str]) -> str:
     ])
 
 
+def _refine_assembly_chains_with_tree_torque(
+    result_complex: dict,
+    seq_a: str,
+    seq_b: str,
+) -> tuple[list, list]:
+    """Run tree-torque (assembly_mode=True, further-from-COM first) on each chain; return (backbone_a, backbone_b)."""
+    bb_a = result_complex["backbone_chain_a"]
+    bb_b = result_complex["backbone_chain_b"]
+    if not run_discrete_refinement or len(bb_a) != 4 * len(seq_a) or len(bb_b) != 4 * len(seq_b):
+        return bb_a, bb_b
+    try:
+        ref_a = run_discrete_refinement(
+            seq_a,
+            initial_backbone_atoms=bb_a,
+            run_until_converged=True,
+            max_phases_cap=100000,
+            assembly_mode=True,
+        )
+        ref_b = run_discrete_refinement(
+            seq_b,
+            initial_backbone_atoms=bb_b,
+            run_until_converged=True,
+            max_phases_cap=100000,
+            assembly_mode=True,
+        )
+        return ref_a.backbone_atoms, ref_b.backbone_atoms
+    except Exception:
+        return bb_a, bb_b
+
+
 def _predict_hke_assembly_with_complex(sequences: list[str]) -> tuple[str, str, str] | None:
     """
-    For exactly 2 chains: run each chain through HKE-with-funnel on its own thread;
-    map bond sites (placement); then run complex with HKE (no funnel) until
-    max displacement per residue < 0.5 Å. Returns (pdb_chain_a, pdb_chain_b, pdb_complex) or None if not 2 chains.
+    For exactly 2 chains: run each chain through HKE-with-funnel; model EM field of each
+    compacted protein; find most likely connection points; place and minimize complex;
+    then tree-torque refinement (assembly mode: vectors from further from COM first) until no allowed moves.
+    Returns (pdb_chain_a, pdb_chain_b, pdb_complex) or None if not 2 chains.
     """
     if len(sequences) != 2:
         return None
@@ -868,11 +1016,12 @@ def _predict_hke_assembly_with_complex(sequences: list[str]) -> tuple[str, str, 
         converge_max_disp_per_100_res=1.0,
         max_dock_iter=600,
     )
-    pdb_a = full_chain_to_pdb(result_a, chain_id="A")
-    pdb_b = full_chain_to_pdb(result_b, chain_id="B")
+    bb_a, bb_b = _refine_assembly_chains_with_tree_torque(result_complex, seq_a, seq_b)
+    pdb_a = full_chain_to_pdb({**result_a, "backbone_atoms": bb_a}, chain_id="A")
+    pdb_b = full_chain_to_pdb({**result_b, "backbone_atoms": bb_b}, chain_id="B")
     pdb_complex = full_chain_to_pdb_complex(
-        result_complex["backbone_chain_a"],
-        result_complex["backbone_chain_b"],
+        bb_a,
+        bb_b,
         result_a["sequence"],
         result_b["sequence"],
         chain_id_a="A",
@@ -883,8 +1032,8 @@ def _predict_hke_assembly_with_complex(sequences: list[str]) -> tuple[str, str, 
 
 def _predict_cartesian_assembly_with_complex(sequences: list[str]) -> tuple[str, str, str] | None:
     """
-    Fallback for 2-chain: Cartesian minimizer per chain (avoids HKE overflow on long chains),
-    then placement + complex minimization. Same outputs as run_pending_assembly_job.py.
+    Fallback for 2-chain: Cartesian minimizer per chain; placement + complex minimization;
+    then tree-torque (assembly mode: further from COM first) until no allowed moves.
     """
     if len(sequences) != 2:
         return None
@@ -901,11 +1050,12 @@ def _predict_cartesian_assembly_with_complex(sequences: list[str]) -> tuple[str,
     result_a, result_b, result_complex = run_two_chain_assembly(
         result_a, result_b, max_dock_iter=60, converge_max_disp_per_100_res=1.0
     )
-    pdb_a = full_chain_to_pdb(result_a, chain_id="A")
-    pdb_b = full_chain_to_pdb(result_b, chain_id="B")
+    bb_a, bb_b = _refine_assembly_chains_with_tree_torque(result_complex, seq_a, seq_b)
+    pdb_a = full_chain_to_pdb({**result_a, "backbone_atoms": bb_a}, chain_id="A")
+    pdb_b = full_chain_to_pdb({**result_b, "backbone_atoms": bb_b}, chain_id="B")
     pdb_complex = full_chain_to_pdb_complex(
-        result_complex["backbone_chain_a"],
-        result_complex["backbone_chain_b"],
+        bb_a,
+        bb_b,
         result_a["sequence"],
         result_b["sequence"],
         chain_id_a="A",
@@ -920,7 +1070,7 @@ def health():
 
 
 def _run_job_in_background(job_id: str) -> None:
-    """Run prediction for job_id (read from pending .request.json); move to outputs and send email on success. No-op if .request.json missing or job already done."""
+    """Run prediction for job_id (read from pending .request.json): fast-pass then HKE. On HKE failure, send fast-pass so user gets at least some result."""
     req_path = os.path.join(PENDING_DIR, f"{job_id}.request.json")
     if not os.path.isfile(req_path):
         return
@@ -944,42 +1094,18 @@ def _run_job_in_background(job_id: str) -> None:
             len(parsed_ligands),
         )
     try:
-        if USE_FAST_PREDICT and hqiv_predict_structure is not None:
-            pdb = hqiv_predict_structure_assembly(sequences) if len(seqs) > 1 else hqiv_predict_structure(sequences[0])
-            _move_to_outputs(job_id, pdb)
-            if to_email:
-                _send_pdb_email(to_email, pdb, job_title)
-        elif len(seqs) == 2:
-            assembly = None
-            try:
-                assembly = _predict_hke_assembly_with_complex(sequences)
-            except Exception as e:
-                app.logger.warning("HKE 2-chain failed, falling back to Cartesian: %s", e)
-                assembly = _predict_cartesian_assembly_with_complex(sequences)
-            if assembly is not None:
-                pdb_a, pdb_b, pdb_complex = assembly
-                _move_to_outputs_assembly(job_id, pdb_complex)
-                if to_email:
-                    _send_assembly_email(to_email, pdb_complex, job_title)
-            else:
-                pdb = _predict_hke_assembly(seqs)
-                _move_to_outputs(job_id, pdb)
-                if to_email:
-                    _send_pdb_email(to_email, pdb, job_title)
-        else:
-            if len(seqs) >= 3:
-                pdb = _predict_hke_assembly_multichain(sequences)
-            elif len(seqs) > 1:
-                pdb = _predict_hke_assembly(seqs)
-            else:
-                pdb = _predict_hke_single(seqs[0], ligands=parsed_ligands if parsed_ligands else None)
-            _move_to_outputs(job_id, pdb)
-            if to_email:
-                _send_pdb_email(to_email, pdb, job_title)
+        _run_full_job_pipelines(
+            job_id=job_id,
+            sequences=sequences,
+            seqs=seqs,
+            to_email=to_email,
+            job_title=job_title,
+            parsed_ligands=parsed_ligands,
+        )
     except Exception as e:
         app.logger.warning("Background job %s failed: %s", job_id, e)
-        if to_email and re.match(r"[^@]+@[^@]+\.[^@]+", to_email):
-            _send_job_failure_email(to_email, job_id, job_title, str(e))
+        # Fast-pass already sent by _run_fast_pass_only; no duplicate email
+        _send_job_failure_email(to_email, job_id, job_title, str(e))
 
 
 @app.route("/predict", methods=["POST"])
@@ -1045,12 +1171,13 @@ def help_page():
 Submit: POST / or POST /predict with FASTA or form/JSON (sequence=, title=, email=).
 Multi-chain: send multiple sequence= values for assembly (chain A, B, C, ...).
 Results: PDB in response body; if email is set and SMTP configured, also sent by email.
+All predictions are refined with tree-torque (no end flag) until no allowed moves.
 
 Endpoints:
-  GET  /       — this info and links
+  GET  /       — main page and full algorithm description
   GET  /help   — this message
   GET  /health — liveness
-  POST / or /predict — structure prediction (HKE + funnel)
+  POST / or /predict — structure prediction (HKE + funnel + tree-torque)
 
 References:
   Repository:  {REPO_URL}
@@ -1060,18 +1187,59 @@ References:
     return Response(body, status=200, mimetype="text/plain")
 
 
+ALGORITHM_DESCRIPTION = r"""
+Prediction algorithm (tunnel + tree-torque refinement)
+
+1) Initial fold
+   Single chain: HKE (hierarchical kinetic expansion) with funnel constraint, or
+   minimize_full_chain when ligands are provided.
+   Assembly (A+B, (A+B)+C): fold each chain; model EM field of each compacted
+   protein; find most likely connection points; place and minimize the complex.
+
+2) Tree-torque refinement (no end flag — run until no allowed moves)
+   All submissions and retries are piped through discrete φ/ψ refinement with
+   EM-field-driven unfreezing until convergence (0 accepts in a phase and EM
+   unfreeze cannot unlock any DOF).
+
+   • Discrete DOFs: per-residue φ/ψ in a small set of states (pyhqiv profiles).
+   • Deterministic downhill: pick the move with lowest ΔE; accept only if ΔE < 0.
+   • Locking: DOFs that cannot improve are locked; when all are locked, use EM
+     field torque to decide which to unfreeze and nudge toward a lower-energy
+     neighbor.
+   • Tree from the ends: build an EM field from the current backbone; compute
+     forces; torque τ_i = (r_i - r_anchor) × F_i. When the N- and C-termini are
+     "free" (not wrapped into the center), anchors are at both ends; torques are
+     combined per residue; residues to unfreeze are ordered from the ends inward
+     (min(i, n_res-1-i)). When either terminus is buried (within 0.5 R_g of
+     center of mass), switch to a single center-of-mass anchor so the torque
+     tree still gives appropriate translations.
+   • Re-draw the field: after each unfreeze/nudge, rebuild the backbone from
+     the current φ/ψ state and recompute the EM field; iterate until no residue
+     is above the torque threshold (or cap per phase).
+   • Assembly (A+B, (A+B)+C | ligand): same algorithm, but we add vectors from
+     residues further from center of mass first (COM anchor, order by distance
+     from COM descending). This keeps the EM field and connection-point logic
+     while stepping through refinement from the surface inward.
+
+3) Output
+   Final PDB is the converged backbone (and ligands if provided). No end flag:
+   refinement runs until no allowed translations remain.
+"""
+
+
 @app.route("/", methods=["GET", "POST"])
 def index():
     """GET: info and links. POST: same as /predict (submission URL)."""
     if request.method == "POST":
         return predict()
-    body = f"""HQIV CASP server — full structure (HKE + funnel)
+    body = f"""HQIV CASP server — full structure (HKE + funnel + tree-torque)
 
   Repository:  {REPO_URL}
   pyhqiv:      {PYHQIV_URL}
   Paper (DOI): {PAPER_DOI_URL}
 
   POST / or /predict with sequence(s); GET /help for API details.
+{ALGORITHM_DESCRIPTION}
 """
     return Response(body, status=200, mimetype="text/plain")
 

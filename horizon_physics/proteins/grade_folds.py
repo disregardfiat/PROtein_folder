@@ -17,9 +17,16 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 
-def load_ca_from_pdb(path: str) -> Tuple[np.ndarray, List[int]]:
+def load_ca_from_pdb(path: str, chain_id: Optional[str] = None) -> Tuple[np.ndarray, List[int]]:
     """
     Load Cα coordinates and residue numbers from a PDB file.
+
+    Parameters
+    ----------
+    path : str
+        Path to PDB file.
+    chain_id : str or None
+        If set, only load Cα from this chain (PDB column 22).
 
     Returns
     -------
@@ -35,6 +42,8 @@ def load_ca_from_pdb(path: str) -> Tuple[np.ndarray, List[int]]:
             if line.startswith("ATOM ") or line.startswith("HETATM"):
                 atom_name = line[12:16].strip()
                 if atom_name != "CA":
+                    continue
+                if chain_id is not None and len(line) > 21 and line[21].strip() != chain_id:
                     continue
                 try:
                     res_id = int(line[22:26].strip())
@@ -112,6 +121,8 @@ def ca_rmsd(
     pred_path: str,
     ref_path: str,
     align_by_resid: bool = True,
+    ref_chain_id: Optional[str] = None,
+    trim_to_min_length: bool = False,
 ) -> Tuple[float, Optional[np.ndarray], np.ndarray, np.ndarray]:
     """
     Compute Cα-RMSD between a predicted PDB and a reference PDB after Kabsch superposition.
@@ -125,6 +136,10 @@ def ca_rmsd(
     align_by_resid : bool
         If True, match Cα by residue ID (ref and pred must have same residue numbers).
         If False, assume same order and length (no residue-number matching).
+    ref_chain_id : str or None
+        If set, load only this chain from the reference PDB (e.g. "B" for 4INS B-chain).
+    trim_to_min_length : bool
+        If True and align_by_resid is False, trim pred and ref to min length (first N residues).
 
     Returns
     -------
@@ -138,7 +153,7 @@ def ca_rmsd(
         Reference Cα (same order as pred_ca).
     """
     pred_ca, pred_res = load_ca_from_pdb(pred_path)
-    ref_ca, ref_res = load_ca_from_pdb(ref_path)
+    ref_ca, ref_res = load_ca_from_pdb(ref_path, chain_id=ref_chain_id)
     if align_by_resid:
         ref_res_to_idx = {r: i for i, r in enumerate(ref_res)}
         common = [r for r in pred_res if r in ref_res_to_idx]
@@ -150,11 +165,16 @@ def ca_rmsd(
         ref_ca = ref_ca[ref_idx]
     else:
         if len(pred_ca) != len(ref_ca):
-            raise ValueError(
-                "Pred has {} Cα, ref has {} Cα; use align_by_resid=True if residue IDs match, or trim to same length.".format(
-                    len(pred_ca), len(ref_ca)
+            if trim_to_min_length:
+                n = min(len(pred_ca), len(ref_ca))
+                pred_ca = pred_ca[:n]
+                ref_ca = ref_ca[:n]
+            else:
+                raise ValueError(
+                    "Pred has {} Cα, ref has {} Cα; use align_by_resid=True if residue IDs match, or trim_to_min_length=True.".format(
+                        len(pred_ca), len(ref_ca)
+                    )
                 )
-            )
     _, _, pred_aligned = kabsch_superpose(ref_ca, pred_ca)
     diff = pred_aligned - ref_ca
     per_res = np.sqrt(np.sum(diff ** 2, axis=1))
