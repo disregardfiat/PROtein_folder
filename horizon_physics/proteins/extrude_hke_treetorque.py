@@ -20,7 +20,7 @@ from . import full_chain_to_pdb, full_chain_to_pdb_complex, minimize_full_chain
 from .backbone_phi_psi import backbone_phi_psi_from_atoms
 from .casp_submission import _place_backbone_ca, _place_full_backbone
 from .hierarchical import minimize_full_chain_hierarchical, hierarchical_result_for_pdb
-from .assembly_dock import run_two_chain_assembly_hke, complex_to_single_chain_result
+from .assembly_dock import run_two_chain_assembly
 from .temperature_path_search import run_discrete_refinement
 
 
@@ -452,15 +452,19 @@ def assembly_hke_treetorque_cycle_two_chains(
     seq_a: str,
     seq_b: str,
     *,
+    temperature: float = 310.0,
+    max_phases_cap: int = 100000,
     hke_max_iter_stages: Tuple[int, int, int],
     rmsd_threshold: float = 1.0,
 ) -> AssemblyExtrudeHKETreeResult:
     """
-    Two-chain assembly: HKE + EM docking + tree-torque (assembly_mode=True) + optional
-    second tree-torque after an HKE refresh of the combined complex.
+    Two-chain assembly: run each chain through the single-chain 3-cycle (extrude +
+    tree-torque + HKE + optional tree-torque), then add them in reduced form via
+    EM-field docking (run_two_chain_assembly), then assembly-mode tree-torque,
+    then optional complex re-minimize + second tree-torque if things moved.
 
-    This mirrors the single-chain HKE/tree-torque cycle, but uses the existing
-    run_two_chain_assembly_hke pipeline and assembly_mode=True in run_discrete_refinement.
+    Both chains are folded in their reduced form first; then coupled via the
+    most obvious bond site and minimized as a complex.
     """
     from .temperature_path_search import run_discrete_refinement as _run_discrete_refinement
     from .grade_folds import ca_rmsd
@@ -471,37 +475,59 @@ def assembly_hke_treetorque_cycle_two_chains(
     if not s_a or not s_b:
         raise ValueError("Empty sequence for assembly_hke_treetorque_cycle_two_chains.")
 
-    # Base A+B assembly via HKE + docking (includes one assembly_mode tree-torque internally)
-    result_a, result_b, result_complex = run_two_chain_assembly_hke(
-        s_a,
-        s_b,
-        funnel_radius=10.0,
-        funnel_radius_exit=20.0,
-        funnel_stiffness=1.0,
-        hke_max_iter_s1=hke_max_iter_stages[0],
-        hke_max_iter_s2=hke_max_iter_stages[1],
-        hke_max_iter_s3=hke_max_iter_stages[2],
-        converge_max_disp_per_100_res=1.0,
+    # 1) Single-chain 3-cycle for each chain (extrude → tree-torque → HKE → tree-torque)
+    res_a = extrude_hke_treetorque_cycle(
+        seq_a,
+        temperature=temperature,
+        max_phases_cap=max_phases_cap,
+        hke_max_iter_stages=hke_max_iter_stages,
+        rmsd_threshold=rmsd_threshold,
+    )
+    res_b = extrude_hke_treetorque_cycle(
+        seq_b,
+        temperature=temperature,
+        max_phases_cap=max_phases_cap,
+        hke_max_iter_stages=hke_max_iter_stages,
+        rmsd_threshold=rmsd_threshold,
+    )
+
+    # 2) Build result dicts and dock in reduced form (EM field, bond site, minimize complex)
+    result_a_dict: Dict[str, Any] = {
+        "backbone_atoms": res_a.backbone_atoms,
+        "sequence": res_a.sequence,
+        "n_res": res_a.n_res,
+        "include_sidechains": False,
+    }
+    result_b_dict: Dict[str, Any] = {
+        "backbone_atoms": res_b.backbone_atoms,
+        "sequence": res_b.sequence,
+        "n_res": res_b.n_res,
+        "include_sidechains": False,
+    }
+    result_a, result_b, result_complex = run_two_chain_assembly(
+        result_a_dict,
+        result_b_dict,
         max_dock_iter=600,
+        converge_max_disp_per_100_res=1.0,
     )
     bb_a = result_complex["backbone_chain_a"]
     bb_b = result_complex["backbone_chain_b"]
 
-    # Optional extra assembly-mode tree-torque on each chain
+    # 3) Assembly-mode tree-torque on each chain (further from COM first)
     if _run_discrete_refinement is not None:
         try:
             ref_a = _run_discrete_refinement(
                 s_a,
                 initial_backbone_atoms=bb_a,
                 run_until_converged=True,
-                max_phases_cap=100000,
+                max_phases_cap=max_phases_cap,
                 assembly_mode=True,
             )
             ref_b = _run_discrete_refinement(
                 s_b,
                 initial_backbone_atoms=bb_b,
                 run_until_converged=True,
-                max_phases_cap=100000,
+                max_phases_cap=max_phases_cap,
                 assembly_mode=True,
             )
             bb_a = ref_a.backbone_atoms
@@ -511,110 +537,92 @@ def assembly_hke_treetorque_cycle_two_chains(
 
     pdb_a = full_chain_to_pdb({**result_a, "backbone_atoms": bb_a}, chain_id="A")
     pdb_b = full_chain_to_pdb({**result_b, "backbone_atoms": bb_b}, chain_id="B")
-    pdb_complex = full_chain_to_pdb_complex(bb_a, bb_b, result_a["sequence"], result_b["sequence"], chain_id_a="A", chain_id_b="B")
+    pdb_complex = full_chain_to_pdb_complex(
+        bb_a, bb_b, result_a["sequence"], result_b["sequence"], chain_id_a="A", chain_id_b="B"
+    )
 
     meta: Dict[str, Any] = {
         "sequence_a": s_a,
         "sequence_b": s_b,
     }
 
-    # HKE refresh of the combined complex, then optional second assembly-mode tree-torque
-    result_combined = complex_to_single_chain_result(
-        {
-            "backbone_chain_a": bb_a,
-            "backbone_chain_b": bb_b,
-            "sequence_a": result_a["sequence"],
-            "sequence_b": result_b["sequence"],
-        }
-    )
+    # 4) "HKE" for complex = re-dock and minimize from tree-torque backbones; then optional second tree-torque
+    result_tt_a = {
+        "backbone_atoms": bb_a,
+        "sequence": s_a,
+        "n_res": len(s_a),
+        "include_sidechains": False,
+    }
+    result_tt_b = {
+        "backbone_atoms": bb_b,
+        "sequence": s_b,
+        "n_res": len(s_b),
+        "include_sidechains": False,
+    }
     try:
-        pos_c, z_c = minimize_full_chain_hierarchical(
-            result_combined["sequence"],
-            include_sidechains=False,
-            funnel_radius=10.0,
-            funnel_stiffness=1.0,
-            funnel_radius_exit=20.0,
-            max_iter_stage1=hke_max_iter_stages[0],
-            max_iter_stage2=hke_max_iter_stages[1],
-            max_iter_stage3=hke_max_iter_stages[2],
+        _, _, result_complex2 = run_two_chain_assembly(
+            result_tt_a,
+            result_tt_b,
+            max_dock_iter=600,
+            converge_max_disp_per_100_res=1.0,
         )
-        result_hke_c = hierarchical_result_for_pdb(
-            pos_c, z_c, result_combined["sequence"], include_sidechains=False
-        )
-        bb_c = result_hke_c.get("backbone_atoms") or []
+        bb_c_a = result_complex2["backbone_chain_a"]
+        bb_c_b = result_complex2["backbone_chain_b"]
     except Exception:
-        bb_c = result_combined["backbone_atoms"]
+        bb_c_a, bb_c_b = bb_a, bb_b
 
-    # Compare complex backbone movement
+    # Compare before/after complex re-minimize
     with tempfile.TemporaryDirectory() as tmpdir:
         path_base = os.path.join(tmpdir, "base.pdb")
-        path_hke = os.path.join(tmpdir, "hke.pdb")
+        path_rem = os.path.join(tmpdir, "rem.pdb")
         with open(path_base, "w") as f:
             f.write(pdb_complex)
-        with open(path_hke, "w") as f:
-            f.write(
-                full_chain_to_pdb(
-                    {
-                        "backbone_atoms": bb_c,
-                        "sequence": result_combined["sequence"],
-                        "n_res": result_combined["n_res"],
-                        "include_sidechains": False,
-                    },
-                    chain_id="A",
-                )
-            )
+        pdb_rem = full_chain_to_pdb_complex(
+            bb_c_a, bb_c_b, result_a["sequence"], result_b["sequence"], chain_id_a="A", chain_id_b="B"
+        )
+        with open(path_rem, "w") as f:
+            f.write(pdb_rem)
         try:
-            rmsd_c, _, _, _ = ca_rmsd(path_base, path_hke, align_by_resid=False, trim_to_min_length=True)
+            rmsd_c, _, _, _ = ca_rmsd(path_base, path_rem, align_by_resid=False, trim_to_min_length=True)
             delta_rmsd_c = float(rmsd_c)
         except Exception:
             delta_rmsd_c = float("inf")
 
-    meta["delta_ca_rmsd_complex_hke"] = delta_rmsd_c
+    meta["delta_ca_rmsd_complex_rem"] = delta_rmsd_c
 
-    # If complex did not move much, keep bb_a/bb_b
-    if not math.isfinite(delta_rmsd_c) or delta_rmsd_c <= rmsd_threshold:
-        return AssemblyExtrudeHKETreeResult(
-            sequence_a=s_a,
-            sequence_b=s_b,
-            backbone_a=bb_a,
-            backbone_b=bb_b,
-            pdb_a=pdb_a,
-            pdb_b=pdb_b,
-            pdb_complex=pdb_complex,
-            meta=meta,
+    if math.isfinite(delta_rmsd_c) and delta_rmsd_c > rmsd_threshold:
+        bb_a, bb_b = bb_c_a, bb_c_b
+        pdb_a = full_chain_to_pdb({**result_a, "backbone_atoms": bb_a}, chain_id="A")
+        pdb_b = full_chain_to_pdb({**result_b, "backbone_atoms": bb_b}, chain_id="B")
+        pdb_complex = full_chain_to_pdb_complex(
+            bb_a, bb_b, result_a["sequence"], result_b["sequence"], chain_id_a="A", chain_id_b="B"
         )
-
-    # Else one more assembly-mode tree-torque on each chain using combined complex as context
-    if _run_discrete_refinement is not None:
-        try:
-            # Re-split bb_c into A/B with same lengths as original sequences
-            n_a = len(result_a["sequence"])
-            n_atoms_a = 4 * n_a
-            bb_a2 = bb_c[:n_atoms_a]
-            bb_b2 = bb_c[n_atoms_a:]
-            ref_a2 = _run_discrete_refinement(
-                s_a,
-                initial_backbone_atoms=bb_a2,
-                run_until_converged=True,
-                max_phases_cap=100000,
-                assembly_mode=True,
-            )
-            ref_b2 = _run_discrete_refinement(
-                s_b,
-                initial_backbone_atoms=bb_b2,
-                run_until_converged=True,
-                max_phases_cap=100000,
-                assembly_mode=True,
-            )
-            bb_a = ref_a2.backbone_atoms
-            bb_b = ref_b2.backbone_atoms
-            pdb_a = full_chain_to_pdb({**result_a, "backbone_atoms": bb_a}, chain_id="A")
-            pdb_b = full_chain_to_pdb({**result_b, "backbone_atoms": bb_b}, chain_id="B")
-            pdb_complex = full_chain_to_pdb_complex(
-                bb_a, bb_b, result_a["sequence"], result_b["sequence"], chain_id_a="A", chain_id_b="B"
-            )
-        except Exception:
-            pass
+        # Second assembly-mode tree-torque after complex re-minimize
+        if _run_discrete_refinement is not None:
+            try:
+                ref_a2 = _run_discrete_refinement(
+                    s_a,
+                    initial_backbone_atoms=bb_a,
+                    run_until_converged=True,
+                    max_phases_cap=max_phases_cap,
+                    assembly_mode=True,
+                )
+                ref_b2 = _run_discrete_refinement(
+                    s_b,
+                    initial_backbone_atoms=bb_b,
+                    run_until_converged=True,
+                    max_phases_cap=max_phases_cap,
+                    assembly_mode=True,
+                )
+                bb_a = ref_a2.backbone_atoms
+                bb_b = ref_b2.backbone_atoms
+                pdb_a = full_chain_to_pdb({**result_a, "backbone_atoms": bb_a}, chain_id="A")
+                pdb_b = full_chain_to_pdb({**result_b, "backbone_atoms": bb_b}, chain_id="B")
+                pdb_complex = full_chain_to_pdb_complex(
+                    bb_a, bb_b, result_a["sequence"], result_b["sequence"], chain_id_a="A", chain_id_b="B"
+                )
+            except Exception:
+                pass
 
     return AssemblyExtrudeHKETreeResult(
         sequence_a=s_a,
