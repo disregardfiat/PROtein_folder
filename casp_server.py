@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import os
 import random
 import re
@@ -54,6 +55,15 @@ try:
     from horizon_physics.proteins.temperature_path_search import run_discrete_refinement
 except Exception:
     run_discrete_refinement = None  # pyhqiv or deps missing; skip tree-torque
+
+try:
+    from horizon_physics.proteins.extrude_hke_treetorque import (
+        extrude_hke_treetorque_cycle,
+        assembly_hke_treetorque_cycle_two_chains,
+    )
+except Exception:
+    extrude_hke_treetorque_cycle = None
+    assembly_hke_treetorque_cycle_two_chains = None
 
 # Fast path (geometric-only, no minimization): for testing or when USE_FAST_PREDICT=1
 try:
@@ -141,13 +151,52 @@ def _job_id() -> str:
     return f"{int(time.time())}_{random.randint(1000, 9999)}"
 
 
+def _sanitize_email_for_fs(email: str) -> str:
+    """Filesystem-safe string from email (for finding jobs by recipient); not exposed in /status."""
+    if not email or not isinstance(email, str):
+        return ""
+    s = email.strip().lower()
+    s = s.replace("@", "_at_").replace(".", "_")
+    s = re.sub(r"[^a-zA-Z0-9_]", "_", s)
+    return s[:80].strip("_") or "no_email"
+
+
+def _pending_base_name(job_id: str, to_email: str | None) -> str:
+    """Base name for pending/output files: {sanitized_email}__{job_id} when email set, else job_id. Not exposed in /status."""
+    if to_email and _sanitize_email_for_fs(to_email):
+        return f"{_sanitize_email_for_fs(to_email)}__{job_id}"
+    return job_id
+
+
+def _base_to_job_id(base: str) -> str:
+    """Extract job_id from file base name (handles both email__job_id and legacy job_id)."""
+    return base.split("__", 1)[1] if "__" in base else base
+
+
+def _find_base_for_job_id(job_id: str, directory: str) -> str | None:
+    """Find file base in directory whose _base_to_job_id(base) == job_id (e.g. from .request.json)."""
+    if not os.path.isdir(directory):
+        return None
+    for name in os.listdir(directory):
+        if name.endswith(".request.json"):
+            base = name[: -len(".request.json")]
+            if _base_to_job_id(base) == job_id:
+                return base
+        if name.endswith(".txt") and not name.endswith(".failed.txt"):
+            base = name[:-4]
+            if _base_to_job_id(base) == job_id:
+                return base
+    return None
+
+
 MAX_ATTEMPTS = 2  # After this many attempts (initial + retries on restart), send failure email instead of retrying
 
 
 def _write_pending_txt(job_id: str, job_title: str | None, to_email: str | None, num_sequences: int, seq_lengths: list[int], attempts: int = 1) -> None:
-    """Write pending/{job_id}.txt with POST summary and attempts count."""
+    """Write pending/{base}.txt with POST summary and attempts count. base = email__job_id when email set."""
     _ensure_output_dirs()
-    path = os.path.join(PENDING_DIR, f"{job_id}.txt")
+    base = _pending_base_name(job_id, to_email)
+    path = os.path.join(PENDING_DIR, f"{base}.txt")
     lines = [
         f"attempts={attempts}",
         f"title={job_title or ''}",
@@ -170,9 +219,10 @@ def _write_pending_request(
     to_email: str | None,
     ligand_str: str | None = None,
 ) -> None:
-    """Write pending/{job_id}.request.json so the job can be retried on restart."""
+    """Write pending/{base}.request.json so the job can be retried on restart. base = email__job_id when email set."""
     _ensure_output_dirs()
-    path = os.path.join(PENDING_DIR, f"{job_id}.request.json")
+    base = _pending_base_name(job_id, to_email)
+    path = os.path.join(PENDING_DIR, f"{base}.request.json")
     payload = {"sequences": sequences, "title": job_title, "email": to_email}
     if ligand_str is not None and ligand_str.strip():
         payload[LIGAND_KEY] = ligand_str.strip()
@@ -180,13 +230,71 @@ def _write_pending_request(
         json.dump(payload, f)
 
 
-def _move_to_outputs(job_id: str, pdb_content: str) -> None:
-    """Write pending/{job_id}.pdb then move .txt, .pdb, and .request.json to outputs/."""
+# PDB sanity: reject coordinates outside this range (Å) or non-finite
+PDB_COORD_MAX = 9999.0
+
+
+def _backbone_sanity_check(backbone_atoms: list, job_context: str = "") -> None:
+    """Raise ValueError if any backbone coordinate is non-finite or |coord| > PDB_COORD_MAX."""
+    for i, (name, xyz) in enumerate(backbone_atoms):
+        try:
+            x, y, z = float(xyz[0]), float(xyz[1]), float(xyz[2])
+        except (IndexError, TypeError, ValueError):
+            raise ValueError(f"Backbone has invalid coordinates at atom {i} ({name}) {job_context}")
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+            raise ValueError(f"Backbone has non-finite coordinates at atom {i} ({name}) {job_context}")
+        if abs(x) > PDB_COORD_MAX or abs(y) > PDB_COORD_MAX or abs(z) > PDB_COORD_MAX:
+            raise ValueError(
+                f"Backbone coordinates out of range at atom {i} ({name}): |x|,|y|,|z| <= {PDB_COORD_MAX} Å {job_context}"
+            )
+
+
+def _pdb_sanity_check(pdb_content: str) -> tuple[bool, str]:
+    """Return (True, '') if PDB coordinates are finite and in [-PDB_COORD_MAX, PDB_COORD_MAX]; else (False, reason)."""
+    # Match ATOM/HETATM lines and extract x,y,z (PDB cols 31-54, or any three numbers if format overflowed)
+    coord_fixed = re.compile(r"^(ATOM  |HETATM).{30}(.{8})(.{8})(.{8})")
+    num_pattern = re.compile(r"-?\d+\.?\d*")
+    for line in pdb_content.splitlines():
+        if not line.startswith("ATOM  ") and not line.startswith("HETATM"):
+            continue
+        # Try fixed columns first
+        m = coord_fixed.match(line)
+        if m:
+            try:
+                x, y, z = float(m.group(1).strip()), float(m.group(2).strip()), float(m.group(3).strip())
+            except ValueError:
+                return False, "Non-numeric coordinates"
+        else:
+            # Overflowed format: take last three numbers on the line
+            nums = num_pattern.findall(line)
+            if len(nums) < 3:
+                continue
+            try:
+                x, y, z = float(nums[-3]), float(nums[-2]), float(nums[-1])
+            except ValueError:
+                return False, "Non-numeric coordinates"
+        if not (abs(x) <= PDB_COORD_MAX and abs(y) <= PDB_COORD_MAX and abs(z) <= PDB_COORD_MAX):
+            return False, f"Coordinates out of range (|x|,|y|,|z| <= {PDB_COORD_MAX} Å)"
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+            return False, "Non-finite coordinates"
+    return True, ""
+
+
+def _prepend_pdb_model_line(pdb_content: str) -> str:
+    """Prepend REMARK with model name for submission (Physical Relational Ontology)."""
+    remark = "REMARK   Model: Physical Relational Ontology\n"
+    if pdb_content.strip().startswith("REMARK"):
+        return remark + pdb_content
+    return remark + pdb_content
+
+
+def _move_to_outputs(base: str, pdb_content: str) -> None:
+    """Write pending/{base}.pdb then move .txt, .pdb, and .request.json to outputs/. base = email__job_id or job_id."""
     _ensure_output_dirs()
-    pdb_path = os.path.join(PENDING_DIR, f"{job_id}.pdb")
+    pdb_path = os.path.join(PENDING_DIR, f"{base}.pdb")
     with open(pdb_path, "w") as f:
         f.write(pdb_content)
-    for name in (f"{job_id}.txt", f"{job_id}.pdb", f"{job_id}.request.json"):
+    for name in (f"{base}.txt", f"{base}.pdb", f"{base}.request.json"):
         src = os.path.join(PENDING_DIR, name)
         dst = os.path.join(OUTPUTS_DIR, name)
         if os.path.isfile(src):
@@ -194,11 +302,11 @@ def _move_to_outputs(job_id: str, pdb_content: str) -> None:
 
 
 def _move_to_outputs_assembly(
-    job_id: str,
+    base: str,
     pdb_complex: str,
 ) -> None:
-    """Write the single combined PDB (chain A + B) and move to outputs/. Same layout as single-chain: job_id.pdb."""
-    _move_to_outputs(job_id, pdb_complex)
+    """Write the single combined PDB (chain A + B) and move to outputs/. Same layout as single-chain: {base}.pdb."""
+    _move_to_outputs(base, pdb_complex)
 
 # Optional SMTP: send PDB to request's "email" address when set
 SMTP_HOST = os.environ.get("SMTP_HOST")
@@ -375,7 +483,7 @@ def _send_assembly_email(
 
 
 def _send_job_failure_email(to_email: str, job_id: str, job_title: str | None, error_message: str) -> None:
-    """Send email on any single failure (includes error details)."""
+    """Send email on any single failure (to requester and CC)."""
     if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
         return
     subject = f"HQIV prediction failed (job {job_id})"
@@ -384,11 +492,13 @@ def _send_job_failure_email(to_email: str, job_id: str, job_title: str | None, e
     msg["Subject"] = subject
     from_addr = _smtp_from_address()
     msg["From"] = formataddr(("HQIV CASP Server", from_addr))
-    # Failure notices should go to the CC/monitoring address when configured,
-    # not to the requesting CASP address.
-    primary = SMTP_CC_TO or to_email
-    msg["To"] = primary
-    recipients = [primary]
+    msg["To"] = to_email
+    recipients = [to_email]
+    if SMTP_CC_TO and re.match(r"[^@]+@[^@]+\.[^@]+", SMTP_CC_TO):
+        cc_addr = SMTP_CC_TO.strip().lower()
+        if cc_addr != (to_email or "").strip().lower():
+            msg["Cc"] = SMTP_CC_TO
+            recipients.append(SMTP_CC_TO)
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain="casp.disregardfiat.tech")
     msg.attach(MIMEText(body, "plain"))
@@ -481,6 +591,7 @@ def _run_fast_pass(sequences: list[str], seqs: list[str]) -> str:
                 max_iter_stage3=max(10, HKE_MAX_ITER[2] // 2),
             )
             result = hierarchical_result_for_pdb(pos, z_list, seq, include_sidechains=False)
+            _backbone_sanity_check(result.get("backbone_atoms") or [], job_context="(HKE fast-pass)")
             cid = chain_ids[i] if i < len(chain_ids) else "A"
             results.append((result, cid))
         return _merge_pdb_chains(results)
@@ -496,11 +607,13 @@ def _run_fast_pass(sequences: list[str], seqs: list[str]) -> str:
         max_iter_stage3=max(10, HKE_MAX_ITER[2] // 2),
     )
     result = hierarchical_result_for_pdb(pos, z_list, seqs[0], include_sidechains=False)
+    _backbone_sanity_check(result.get("backbone_atoms") or [], job_context="(HKE fast-pass)")
     return full_chain_to_pdb(result, chain_id="A")
 
 
 def _run_fast_pass_only(
     job_id: str,
+    base: str,
     sequences: list[str],
     seqs: list[str],
     to_email: str | None,
@@ -508,10 +621,10 @@ def _run_fast_pass_only(
 ) -> None:
     """
     Run fast-pass only: write .fast.pdb, send first email. Does NOT increment attempts.
-    Used by process_pending_jobs Phase 1 to give everyone a quick result.
+    Used by process_pending_jobs Phase 1 to give everyone a quick result. base = email__job_id or job_id for paths.
     """
     fast_pdb = _run_fast_pass(sequences, seqs)
-    fast_path = os.path.join(PENDING_DIR, f"{job_id}.fast.pdb")
+    fast_path = os.path.join(PENDING_DIR, f"{base}.fast.pdb")
     with open(fast_path, "w") as f:
         f.write(fast_pdb)
     if to_email:
@@ -562,6 +675,13 @@ def _run_hke_only(
     else:
         hke_pdb = _predict_hke_single(seqs[0], ligands=parsed_ligands if parsed_ligands else None)
 
+    # Prepend submission model line and sanity-check before moving or sending
+    hke_pdb = _prepend_pdb_model_line(hke_pdb)
+    fast_pdb = _prepend_pdb_model_line(fast_pdb)
+    ok, reason = _pdb_sanity_check(hke_pdb)
+    if not ok:
+        raise ValueError(f"PDB sanity check failed: {reason}")
+
     # Move main HKE PDB + bookkeeping via existing helper
     _move_to_outputs(job_id, hke_pdb)
 
@@ -600,7 +720,7 @@ def _run_hke_only(
     except Exception as e:
         app.logger.warning("Failed to write models.json for job %s: %s", job_id, e)
 
-    # 3) Second email: HKE as Prediction1.pdb, fast-pass as Prediction2.pdb
+    # 3) Second email: HKE as Prediction1.pdb, fast-pass as Prediction2.pdb (to requester and CC)
     if to_email:
         _send_pdb_email_multi(
             to_email,
@@ -630,24 +750,25 @@ def _run_full_job_pipelines(
 
 def process_pending_jobs() -> None:
     """
-    Two-phase queue on startup:
-    Phase 1: Run fast-pass for all jobs missing .fast.pdb (quick result for everyone).
-    Phase 2: Run HKE for jobs that have .fast.pdb, ordered by .fast.pdb size (smallest first).
+    Two-phase queue on startup; one thread per fold.
+    Phase 1: One thread per job missing .fast.pdb (fast-pass in parallel); join before Phase 2.
+    Phase 2: One thread per job that has .fast.pdb (HKE + tree-torque in parallel, no join).
     On HKE failure: increment attempts; send fast-pass to requester so they get at least some result.
     """
     _ensure_output_dirs()
     if not os.path.isdir(PENDING_DIR):
         return
 
-    # Collect valid jobs: have .txt and .request.json, no outputs .pdb
+    # Collect valid jobs: have .txt and .request.json, no outputs .pdb (filename base = email__job_id or job_id)
     jobs: list[dict] = []
     for name in os.listdir(PENDING_DIR):
         if not name.endswith(".txt") or name.endswith(".failed.txt"):
             continue
-        job_id = name[:-4]
-        txt_path = os.path.join(PENDING_DIR, f"{job_id}.txt")
-        req_path = os.path.join(PENDING_DIR, f"{job_id}.request.json")
-        out_pdb = os.path.join(OUTPUTS_DIR, f"{job_id}.pdb")
+        base = name[:-4]
+        job_id = _base_to_job_id(base)
+        txt_path = os.path.join(PENDING_DIR, name)
+        req_path = os.path.join(PENDING_DIR, f"{base}.request.json")
+        out_pdb = os.path.join(OUTPUTS_DIR, f"{base}.pdb")
         if os.path.isfile(out_pdb):
             continue  # Already done
         if not os.path.isfile(req_path):
@@ -663,7 +784,7 @@ def process_pending_jobs() -> None:
             except Exception:
                 pass
             try:
-                shutil.move(txt_path, os.path.join(OUTPUTS_DIR, f"{job_id}.failed.txt"))
+                shutil.move(txt_path, os.path.join(OUTPUTS_DIR, f"{base}.failed.txt"))
             except Exception:
                 pass
             continue
@@ -683,6 +804,7 @@ def process_pending_jobs() -> None:
         parsed_ligands = parse_ligands(ligand_str) if ligand_str else []
         jobs.append({
             "job_id": job_id,
+            "base": base,
             "txt_path": txt_path,
             "req_path": req_path,
             "sequences": sequences,
@@ -698,38 +820,51 @@ def process_pending_jobs() -> None:
         if j["attempts"] >= MAX_ATTEMPTS:
             _send_failure_email(j["to_email"], j["job_id"], j["job_title"])
             try:
-                shutil.move(j["txt_path"], os.path.join(OUTPUTS_DIR, f"{j['job_id']}.failed.txt"))
+                shutil.move(j["txt_path"], os.path.join(OUTPUTS_DIR, f"{j['base']}.failed.txt"))
             except Exception:
                 pass
     jobs = [j for j in jobs if j["attempts"] < MAX_ATTEMPTS]
 
-    # Phase 1: Run fast-pass for jobs missing .fast.pdb (no attempt increment)
-    for j in jobs:
-        fast_path = os.path.join(PENDING_DIR, f"{j['job_id']}.fast.pdb")
-        if not os.path.isfile(fast_path):
-            if j["parsed_ligands"]:
-                app.logger.info(
-                    "Ligand detected via key %s → %d ligands added as 6-DOF agents",
-                    LIGAND_KEY,
-                    len(j["parsed_ligands"]),
-                )
-            try:
-                _run_fast_pass_only(
-                    j["job_id"], j["sequences"], j["seqs"], j["to_email"], j["job_title"]
-                )
-            except Exception as e:
-                app.logger.warning("Pending job %s fast-pass failed: %s", j["job_id"], e)
+    # Phase 1: one thread per job missing .fast.pdb (fast-pass in parallel)
+    def _run_one_fast_pass(j: dict) -> None:
+        fast_path = os.path.join(PENDING_DIR, f"{j['base']}.fast.pdb")
+        if os.path.isfile(fast_path):
+            return
+        if j["parsed_ligands"]:
+            app.logger.info(
+                "Ligand detected via key %s → %d ligands added as 6-DOF agents",
+                LIGAND_KEY,
+                len(j["parsed_ligands"]),
+            )
+        try:
+            _run_fast_pass_only(
+                j["job_id"], j["base"], j["sequences"], j["seqs"], j["to_email"], j["job_title"]
+            )
+        except Exception as e:
+            app.logger.warning("Pending job %s fast-pass failed: %s", j["job_id"], e)
 
-    # Phase 2: HKE jobs sorted by .fast.pdb size (smallest first = lowest hanging fruit)
+    phase1_threads = []
+    for j in jobs:
+        t = threading.Thread(target=_run_one_fast_pass, args=(j,), daemon=True)
+        t.start()
+        phase1_threads.append(t)
+    for t in phase1_threads:
+        t.join()
+
+    # Phase 2: one thread per fold — prefer single-chain, then by .fast.pdb size
     hke_jobs = []
     for j in jobs:
-        fast_path = os.path.join(PENDING_DIR, f"{j['job_id']}.fast.pdb")
-        out_pdb = os.path.join(OUTPUTS_DIR, f"{j['job_id']}.pdb")
+        fast_path = os.path.join(PENDING_DIR, f"{j['base']}.fast.pdb")
+        out_pdb = os.path.join(OUTPUTS_DIR, f"{j['base']}.pdb")
         if os.path.isfile(fast_path) and not os.path.isfile(out_pdb):
-            hke_jobs.append((os.path.getsize(fast_path), j))
-    hke_jobs.sort(key=lambda x: x[0])
+            size = os.path.getsize(fast_path)
+            # Prefer single-chain (1) over assembly (0); then smallest first
+            single_chain = 1 if len(j["seqs"]) == 1 else 0
+            hke_jobs.append((single_chain, size, j))
+    hke_jobs.sort(key=lambda x: (-x[0], x[1]))  # single-chain first, then by size
 
-    for _size, j in hke_jobs:
+    def _run_one_hke_job(j: dict) -> None:
+        """Run HKE + tree-torque for one job; update attempts and move to failed on exception."""
         if j["parsed_ligands"]:
             app.logger.info(
                 "Ligand detected via key %s → %d ligands added as 6-DOF agents",
@@ -738,19 +873,23 @@ def process_pending_jobs() -> None:
             )
         try:
             _run_hke_only(
-                j["job_id"], j["sequences"], j["seqs"], j["to_email"], j["job_title"], j["parsed_ligands"]
+                j["job_id"], j["base"], j["sequences"], j["seqs"], j["to_email"], j["job_title"], j["parsed_ligands"]
             )
         except Exception as e:
             app.logger.warning("Pending job %s HKE failed: %s", j["job_id"], e)
             new_attempts = j["attempts"] + 1
             _update_pending_attempts(j["txt_path"], new_attempts)
-            # Fast-pass already sent in Phase 1; no duplicate email
+            # Always notify requester and CC on failure (e.g. sanity check or HKE error)
+            if j["to_email"]:
+                _send_job_failure_email(j["to_email"], j["job_id"], j["job_title"], str(e))
             if new_attempts >= MAX_ATTEMPTS:
-                _send_failure_email(j["to_email"], j["job_id"], j["job_title"])
                 try:
-                    shutil.move(j["txt_path"], os.path.join(OUTPUTS_DIR, f"{j['job_id']}.failed.txt"))
+                    shutil.move(j["txt_path"], os.path.join(OUTPUTS_DIR, f"{j['base']}.failed.txt"))
                 except Exception:
                     pass
+
+    for _single, _size, j in hke_jobs:
+        threading.Thread(target=_run_one_hke_job, args=(j,), daemon=True).start()
 
 
 def _sequence_from_input(raw: str) -> str:
@@ -762,7 +901,14 @@ def _sequence_from_input(raw: str) -> str:
 
 
 def _predict_hke_single(sequence: str, ligands: list | None = None) -> str:
-    """Run HKE + funnel for one chain; then tree-torque refinement (no end flag) until no allowed moves; return PDB (chain A)."""
+    """
+    Run single-chain prediction.
+
+    Preferred path (when available): 7K00 tunnel extrusion + tree-torque + HKE + optional tree-torque cycle.
+    Fallbacks:
+      - When ligands are present: minimize_full_chain(include_ligands=True) + tree-torque.
+      - When extrusion/HKE cycle helper is unavailable: HKE + tree-torque as before.
+    """
     if ligands:
         result = minimize_full_chain(
             sequence,
@@ -770,6 +916,7 @@ def _predict_hke_single(sequence: str, ligands: list | None = None) -> str:
             include_ligands=True,
             ligands=ligands,
         )
+        _backbone_sanity_check(result.get("backbone_atoms") or [], job_context="(minimize_full_chain)")
         backbone = result.get("backbone_atoms")
         seq = result.get("sequence", sequence)
         if run_discrete_refinement and backbone and len(backbone) == 4 * len(seq):
@@ -784,6 +931,32 @@ def _predict_hke_single(sequence: str, ligands: list | None = None) -> str:
             except Exception:
                 pass
         return full_chain_to_pdb(result, chain_id="A", ligands=result.get("ligands"))
+
+    # Prefer full extrusion + HKE + tree-torque cycle when helper and pyhqiv are available.
+    if extrude_hke_treetorque_cycle is not None and run_discrete_refinement is not None:
+        try:
+            cyc = extrude_hke_treetorque_cycle(
+                sequence,
+                temperature=310.0,
+                max_phases_cap=100000,
+                hke_max_iter_stages=HKE_MAX_ITER,
+                rmsd_threshold=1.0,
+            )
+            # Sanity-check backbone before building PDB; prepend model line later at send/move time.
+            _backbone_sanity_check(cyc.backbone_atoms or [], job_context="(extrude+HKE+tree-torque)")
+            return full_chain_to_pdb(
+                {
+                    "backbone_atoms": cyc.backbone_atoms,
+                    "sequence": cyc.sequence,
+                    "n_res": cyc.n_res,
+                    "include_sidechains": False,
+                },
+                chain_id="A",
+            )
+        except Exception as e:
+            app.logger.warning("Extrude+HKE+tree-torque cycle failed for single-chain: %s", e)
+            # Fall back to HKE + tree-torque below.
+
     pos, z_list = minimize_full_chain_hierarchical(
         sequence,
         include_sidechains=False,
@@ -795,6 +968,7 @@ def _predict_hke_single(sequence: str, ligands: list | None = None) -> str:
         max_iter_stage3=HKE_MAX_ITER[2],
     )
     result = hierarchical_result_for_pdb(pos, z_list, sequence, include_sidechains=False)
+    _backbone_sanity_check(result.get("backbone_atoms") or [], job_context="(HKE)")
     backbone = result.get("backbone_atoms")
     seq = result.get("sequence", sequence)
     if run_discrete_refinement and backbone and len(backbone) == 4 * len(seq):
@@ -876,6 +1050,7 @@ def _predict_hke_assembly(sequences: list[str]) -> str:
             max_iter_stage3=HKE_MAX_ITER[2],
         )
         result = hierarchical_result_for_pdb(pos, z_list, seq, include_sidechains=False)
+        _backbone_sanity_check(result.get("backbone_atoms") or [], job_context="(HKE assembly)")
         cid = chain_ids[i] if i < len(chain_ids) else "A"
         results.append((result, cid))
     return _merge_pdb_chains(results)
@@ -894,6 +1069,18 @@ def _predict_hke_assembly_multichain(sequences: list[str]) -> str:
     if len(seqs) == 1:
         return _predict_hke_single(seqs[0], ligands=None)
     if len(seqs) == 2:
+        # Prefer full EM-field assembly cycle (HKE + assembly-mode tree-torque + HKE + tree-torque)
+        if assembly_hke_treetorque_cycle_two_chains is not None and run_discrete_refinement is not None:
+            try:
+                cyc = assembly_hke_treetorque_cycle_two_chains(
+                    seqs[0],
+                    seqs[1],
+                    hke_max_iter_stages=HKE_MAX_ITER,
+                    rmsd_threshold=1.0,
+                )
+                return cyc.pdb_complex
+            except Exception as e:
+                app.logger.warning("Assembly HKE+tree-torque cycle failed for 2-chain: %s", e)
         assembly = _predict_hke_assembly_with_complex(sequences)
         if assembly is not None:
             return assembly[2]
@@ -928,6 +1115,7 @@ def _predict_hke_assembly_multichain(sequences: list[str]) -> str:
             max_iter_stage3=HKE_MAX_ITER[2],
         )
         result_c = hierarchical_result_for_pdb(pos, z_list, seqs[i], include_sidechains=False)
+        _backbone_sanity_check(result_c.get("backbone_atoms") or [], job_context="(HKE assembly C)")
         _, _, result_ab = run_two_chain_assembly(
             result_combined,
             result_c,
@@ -1069,6 +1257,68 @@ def health():
     return Response("OK\n", status=200, mimetype="text/plain")
 
 
+def _status_request_info(job_id: str) -> dict | None:
+    """Load request.json for job_id from pending or outputs; return request array without email."""
+    for base in (PENDING_DIR, OUTPUTS_DIR):
+        path = os.path.join(base, f"{job_id}.request.json")
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path) as f:
+                req = json.load(f)
+        except Exception:
+            return None
+        sequences = req.get("sequences") or []
+        seqs = [_sequence_from_input(s) for s in sequences if s]
+        lengths = [len(s) for s in seqs]
+        return {
+            "num_sequences": len(seqs),
+            "lengths": lengths,
+            "title": req.get("title") or "",
+        }
+    return None
+
+
+@app.route("/status", methods=["GET"])
+def status():
+    """
+    List all jobs: job_id, request info (no email), and status (pending / done / failed).
+    """
+    _ensure_output_dirs()
+    job_ids = set()
+    if os.path.isdir(PENDING_DIR):
+        for name in os.listdir(PENDING_DIR):
+            if name.endswith(".request.json"):
+                job_ids.add(name[:- len(".request.json")])
+    if os.path.isdir(OUTPUTS_DIR):
+        for name in os.listdir(OUTPUTS_DIR):
+            if name.endswith(".pdb") and not name.endswith(".fast.pdb"):
+                job_ids.add(name[:-4])
+            if name.endswith(".failed.txt"):
+                job_ids.add(name[:- len(".failed.txt")])
+    jobs = []
+    for job_id in sorted(job_ids):
+        out_pdb = os.path.join(OUTPUTS_DIR, f"{job_id}.pdb")
+        out_failed = os.path.join(OUTPUTS_DIR, f"{job_id}.failed.txt")
+        if os.path.isfile(out_pdb):
+            status_val = "done"
+        elif os.path.isfile(out_failed):
+            status_val = "failed"
+        else:
+            status_val = "pending"
+        request_info = _status_request_info(job_id)
+        jobs.append({
+            "job_id": job_id,
+            "request": request_info if request_info is not None else {},
+            "status": status_val,
+        })
+    return Response(
+        json.dumps({"jobs": jobs}, indent=2),
+        status=200,
+        mimetype="application/json",
+    )
+
+
 def _run_job_in_background(job_id: str) -> None:
     """Run prediction for job_id (read from pending .request.json): fast-pass then HKE. On HKE failure, send fast-pass so user gets at least some result."""
     req_path = os.path.join(PENDING_DIR, f"{job_id}.request.json")
@@ -1177,6 +1427,7 @@ Endpoints:
   GET  /       — main page and full algorithm description
   GET  /help   — this message
   GET  /health — liveness
+  GET  /status — list jobs: job_id, request (num_sequences, lengths, title; no email), status (pending/done/failed)
   POST / or /predict — structure prediction (HKE + funnel + tree-torque)
 
 References:
