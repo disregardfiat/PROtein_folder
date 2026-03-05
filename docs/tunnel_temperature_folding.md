@@ -162,3 +162,15 @@ This design connects the **initial plausible geometry** (Cartesian), the **co‑
 - **Final PDB sanity check** before move/send: coordinates must be finite and \|coord\| ≤ 9999 Å; otherwise the job fails and a failure email is sent (requester + CC), and the bad PDB is not moved to outputs.
 - **Backbone sanity check right after HKE**: After every `hierarchical_result_for_pdb` (and after `minimize_full_chain` when ligands are used), the server runs `_backbone_sanity_check(backbone_atoms)`. If any backbone coordinate is non‑finite or out of range, it raises before tree‑torque or output, so a blown‑up backbone is never passed on or sent.
 
+---
+
+### 7. Known CASP targets and experimental refs (equal footing)
+
+When **CASP_KNOWN_TARGETS_CACHE** is set to a directory path, the server:
+
+1. Fetches the list of known targets from **predictioncenter.org** (sequences + PDB codes from the target list) for the round given by **CASP_ROUND** (default CASP16).
+2. On each prediction job, matches the request sequence(s) to these targets (exact match).
+3. If there is a match and the target has a released experimental structure (PDB code), the server downloads that PDB from RCSB (if not already in the cache) and copies it to **outputs** as `{base}.experimental_ref.pdb` alongside the prediction.
+
+So we are on the same footing as other teams: we use the same experimental data from the Prediction Center, then run our **A+B assembly strategy** (or single-chain pipeline) as usual. The experimental ref in outputs allows direct comparison (e.g. with `grade_folds.ca_rmsd`) without manual lookup.
+

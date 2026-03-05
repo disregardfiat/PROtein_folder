@@ -211,6 +211,7 @@ R_BOND_MIN = 2.5   # Å, below = clash
 R_BOND_MAX = 6.0   # Å, above = broken chain
 R_CLASH = 2.0      # Å, non-bonded atoms closer = clash
 K_BOND = 200.0 * HBAR_C_EV_ANG  # strong penalty to keep chain intact
+K_BOND_EM_RELAX = 2.5  # eV/Å² for EM-field relax step only; from pyhqiv when available
 K_CLASH = 500.0 * HBAR_C_EV_ANG
 
 # Radius-of-gyration collapse bias (optional, for long-chain globule formation)

@@ -1,6 +1,6 @@
 # PROtein — HQIV Protein Folding
 
-First-principles protein structure prediction from the **Horizon-centric Quantum Information and Vacuum (HQIV)** framework. No empirical force fields, no PDB statistics.
+Physically Rotating by Order: First-principles protein structure prediction from the **Horizon-centric Quantum Information and Vacuum (HQIV)** framework. No empirical force fields, no PDB statistics.
 HQIV => https://zenodo.org/records/18794890
 
 ## Quick start
@@ -69,4 +69,7 @@ The visualizer runs in a separate process and tails the JSONL file, so it does n
 
 ## License
 
-MIT
+**License note (March 2026)**  
+This project is released under the MIT License **with an explicit Government Use Restriction**.  
+Governments worldwide may **not** use, fork, or run this software without first purchasing a paid seat from me (disregardfiat). Seat availability and pricing are at my sole discretion.  
+Individuals, companies, universities, and non-profits continue to enjoy full MIT rights.

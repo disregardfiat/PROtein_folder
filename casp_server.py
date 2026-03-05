@@ -4,7 +4,7 @@ POST /predict with body = FASTA or form/JSON (sequence=, title=, email=).
 Uses minimize_full_chain_hierarchical with cone funnel (stages 1–2) then Cartesian refinement (stage 3).
 If "email" param is set and SMTP is configured, also sends PDB by email.
 GET /health → 200 OK.
-Env: SMTP_* for email; SMTP_CC_TO to CC when not recipient; CASP_OUTPUT_DIR (default ./casp_results) for pending/ and outputs/; USE_FAST_PREDICT=1 to skip HKE.
+Env: SMTP_* for email; SMTP_CC_TO to CC when not recipient; CASP_OUTPUT_DIR (default ./casp_results) for pending/ and outputs/; USE_FAST_PREDICT=1 to skip HKE; PREDICTION_TIMEOUT_SEC (default 3600) to stop after 1h and send current PDB; CASP_KNOWN_TARGETS_CACHE (optional) dir to cache known targets and experimental PDBs from predictioncenter.org for equal footing; CASP_ROUND (default CASP16).
 Run from repo root: gunicorn -w 1 -b 127.0.0.1:8050 casp_server:app
 """
 
@@ -65,6 +65,19 @@ except Exception:
     extrude_hke_treetorque_cycle = None
     assembly_hke_treetorque_cycle_two_chains = None
 
+try:
+    from horizon_physics.proteins.casp_targets import (
+        fetch_known_targets,
+        get_target_for_sequence,
+        get_target_for_sequences,
+        ensure_experimental_ref,
+    )
+except Exception:
+    fetch_known_targets = None
+    get_target_for_sequence = None
+    get_target_for_sequences = None
+    ensure_experimental_ref = None
+
 # Fast path (geometric-only, no minimization): for testing or when USE_FAST_PREDICT=1
 try:
     from horizon_physics.proteins import hqiv_predict_structure, hqiv_predict_structure_assembly
@@ -84,6 +97,13 @@ HKE_MAX_ITER = (
     int(os.environ.get("HKE_MAX_ITER_S2", "25")),
     int(os.environ.get("HKE_MAX_ITER_S3", "50")),
 )
+# Stop prediction after this many seconds; write current PDB, send email, then pick up next job.
+PREDICTION_TIMEOUT_SEC = int(os.environ.get("PREDICTION_TIMEOUT_SEC", "3600"))  # 1 hour
+
+# Optional: cache dir for CASP known targets and experimental PDBs (predictioncenter.org). When set,
+# we match request sequences to known targets and fetch experimental refs so we're on equal footing.
+CASP_KNOWN_TARGETS_CACHE = (os.environ.get("CASP_KNOWN_TARGETS_CACHE") or "").strip() or None
+CASP_ROUND = os.environ.get("CASP_ROUND", "CASP16")
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # 2 MB max FASTA
@@ -97,6 +117,61 @@ OUTPUTS_DIR = os.path.join(_output_base, "outputs")
 def _ensure_output_dirs() -> None:
     os.makedirs(PENDING_DIR, exist_ok=True)
     os.makedirs(OUTPUTS_DIR, exist_ok=True)
+
+
+# Lazy-loaded list of known CASP targets (when CASP_KNOWN_TARGETS_CACHE is set)
+_known_casp_targets: list | None = None
+
+
+def _get_known_casp_targets() -> list:
+    """Load known CASP targets once (sequences + PDB codes) when cache dir is set."""
+    global _known_casp_targets
+    if _known_casp_targets is not None:
+        return _known_casp_targets
+    if not CASP_KNOWN_TARGETS_CACHE or fetch_known_targets is None:
+        _known_casp_targets = []
+        return _known_casp_targets
+    try:
+        _known_casp_targets = fetch_known_targets(
+            casp_round=CASP_ROUND,
+            cache_dir=CASP_KNOWN_TARGETS_CACHE,
+            fill_pdb_codes=True,
+        )
+        app.logger.info(
+            "Loaded %d known CASP targets from predictioncenter.org (%s)",
+            len(_known_casp_targets),
+            CASP_ROUND,
+        )
+    except Exception as e:
+        app.logger.warning("Failed to load known CASP targets: %s", e)
+        _known_casp_targets = []
+    return _known_casp_targets
+
+
+def _experimental_ref_path_for_job(seqs: list[str], base: str) -> str | None:
+    """
+    If request sequences match a known CASP target with experimental structure,
+    fetch it and return path to copy to outputs (so we're on equal footing).
+    Returns path to cached experimental PDB, or None.
+    """
+    if not CASP_KNOWN_TARGETS_CACHE or ensure_experimental_ref is None:
+        return None
+    known = _get_known_casp_targets()
+    if not known:
+        return None
+    target = None
+    if len(seqs) == 1:
+        hit = get_target_for_sequence(seqs[0], known) if get_target_for_sequence else None
+        if hit:
+            target = hit[0]
+    elif len(seqs) >= 2:
+        hit = get_target_for_sequences(seqs[:2], known) if get_target_for_sequences else None
+        if hit:
+            target = hit[0]
+    if not target or not target.pdb_code:
+        return None
+    path = ensure_experimental_ref(target, CASP_KNOWN_TARGETS_CACHE)
+    return path
 
 
 def _gather_ligand_str(request) -> str | None:
@@ -438,8 +513,9 @@ def _send_pdb_email_multi(
     to_email: str,
     models: list[tuple[str, str]],
     title: str | None,
+    body_extra: str | None = None,
 ) -> None:
-    """Send multiple PDB models as separate attachments."""
+    """Send multiple PDB models as separate attachments. body_extra is appended to the text body (e.g. time-limit note)."""
     if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
         return
     subject = f"HQIV prediction: {title}" if title else "HQIV structure prediction"
@@ -457,7 +533,10 @@ def _send_pdb_email_multi(
             recipients.append(SMTP_CC_TO)
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain="casp.disregardfiat.tech")
-    msg.attach(MIMEText("PDB models attached (CASP format).", "plain"))
+    body = "PDB models attached (CASP format)."
+    if body_extra:
+        body += "\n\n" + body_extra
+    msg.attach(MIMEText(body, "plain"))
     for filename, pdb in models:
         part = MIMEText(pdb, "plain")
         part.add_header("Content-Disposition", "attachment", filename=filename)
@@ -633,6 +712,7 @@ def _run_fast_pass_only(
 
 def _run_hke_only(
     job_id: str,
+    base: str,
     sequences: list[str],
     seqs: list[str],
     to_email: str | None,
@@ -642,20 +722,25 @@ def _run_hke_only(
     """
     Run HKE pipeline only. Assumes .fast.pdb exists in pending.
     On success: move to outputs, send second email (HKE + fast).
+    On timeout (1h): write current PDB, send email with time-limit note, move to outputs, pick up next job.
     On failure: raises (caller sends fast-pass so user gets at least some result).
     """
-    fast_path = os.path.join(PENDING_DIR, f"{job_id}.fast.pdb")
+    fast_path = os.path.join(PENDING_DIR, f"{base}.fast.pdb")
     with open(fast_path) as f:
         fast_pdb = f.read()
 
     # If USE_FAST_PREDICT, treat fast-pass as final (no HKE)
     if USE_FAST_PREDICT and hqiv_predict_structure is not None:
-        _move_to_outputs(job_id, fast_pdb)
+        _move_to_outputs(base, fast_pdb)
         try:
-            shutil.move(fast_path, os.path.join(OUTPUTS_DIR, f"{job_id}.fast.pdb"))
+            shutil.move(fast_path, os.path.join(OUTPUTS_DIR, f"{base}.fast.pdb"))
         except Exception:
             pass
         return
+
+    deadline = time.time() + PREDICTION_TIMEOUT_SEC
+    timed_out = False
+    hke_pdb = None
 
     # Full HKE pipeline (single or multi-chain)
     if len(seqs) == 2:
@@ -673,7 +758,14 @@ def _run_hke_only(
     elif len(seqs) >= 3:
         hke_pdb = _predict_hke_assembly_multichain(sequences)
     else:
-        hke_pdb = _predict_hke_single(seqs[0], ligands=parsed_ligands if parsed_ligands else None)
+        hke_pdb, timed_out = _predict_hke_single(
+            seqs[0],
+            ligands=parsed_ligands if parsed_ligands else None,
+            deadline_sec=deadline,
+        )
+        if timed_out and hke_pdb is None:
+            hke_pdb = fast_pdb
+            app.logger.info("Job %s hit %ds timeout before HKE; sending fast-pass as result.", job_id, PREDICTION_TIMEOUT_SEC)
 
     # Prepend submission model line and sanity-check before moving or sending
     hke_pdb = _prepend_pdb_model_line(hke_pdb)
@@ -683,18 +775,28 @@ def _run_hke_only(
         raise ValueError(f"PDB sanity check failed: {reason}")
 
     # Move main HKE PDB + bookkeeping via existing helper
-    _move_to_outputs(job_id, hke_pdb)
+    _move_to_outputs(base, hke_pdb)
 
-    # After move_to_outputs, pending/{job_id}.pdb is now in outputs/; move fast-pass too
-    out_fast = os.path.join(OUTPUTS_DIR, f"{job_id}.fast.pdb")
+    # After move_to_outputs, pending/{base}.pdb is now in outputs/; move fast-pass too
+    out_fast = os.path.join(OUTPUTS_DIR, f"{base}.fast.pdb")
     try:
         if os.path.isfile(fast_path):
             shutil.move(fast_path, out_fast)
     except Exception:
         pass
 
+    # If request matches a known CASP target with experimental structure, copy ref to outputs (equal footing)
+    ref_src = _experimental_ref_path_for_job(seqs, base)
+    if ref_src and os.path.isfile(ref_src):
+        ref_dst = os.path.join(OUTPUTS_DIR, f"{base}.experimental_ref.pdb")
+        try:
+            shutil.copy2(ref_src, ref_dst)
+            app.logger.info("Copied experimental ref to %s", ref_dst)
+        except Exception as e:
+            app.logger.warning("Could not copy experimental ref: %s", e)
+
     # Record models.json in outputs
-    models_path = os.path.join(OUTPUTS_DIR, f"{job_id}.models.json")
+    models_path = os.path.join(OUTPUTS_DIR, f"{base}.models.json")
     try:
         record = {
             "job_id": job_id,
@@ -705,13 +807,13 @@ def _run_hke_only(
                     "name": "Prediction1.pdb",
                     "stage": "hke",
                     "type": "hke",
-                    "file": f"{job_id}.pdb",
+                    "file": f"{base}.pdb",
                 },
                 {
                     "name": "Prediction2.pdb",
                     "stage": "fast",
                     "type": "fast",
-                    "file": f"{job_id}.fast.pdb",
+                    "file": f"{base}.fast.pdb",
                 },
             ],
         }
@@ -722,6 +824,12 @@ def _run_hke_only(
 
     # 3) Second email: HKE as Prediction1.pdb, fast-pass as Prediction2.pdb (to requester and CC)
     if to_email:
+        body_extra = None
+        if timed_out:
+            body_extra = (
+                f"This prediction was stopped after the {PREDICTION_TIMEOUT_SEC // 3600}-hour time limit. "
+                "The attached model is the best structure obtained up to that point."
+            )
         _send_pdb_email_multi(
             to_email,
             models=[
@@ -729,11 +837,13 @@ def _run_hke_only(
                 ("Prediction2.pdb", fast_pdb),
             ],
             title=job_title,
+            body_extra=body_extra,
         )
 
 
 def _run_full_job_pipelines(
     job_id: str,
+    base: str,
     sequences: list[str],
     seqs: list[str],
     to_email: str | None,
@@ -742,10 +852,10 @@ def _run_full_job_pipelines(
 ) -> None:
     """
     For a given job: run fast-pass first (send fast email), then full HKE pipeline.
-    Used by _run_job_in_background for new POST jobs.
+    Used by _run_job_in_background for new POST jobs. base = email__job_id or job_id for paths.
     """
-    _run_fast_pass_only(job_id, sequences, seqs, to_email, job_title)
-    _run_hke_only(job_id, sequences, seqs, to_email, job_title, parsed_ligands)
+    _run_fast_pass_only(job_id, base, sequences, seqs, to_email, job_title)
+    _run_hke_only(job_id, base, sequences, seqs, to_email, job_title, parsed_ligands)
 
 
 def process_pending_jobs() -> None:
@@ -900,15 +1010,18 @@ def _sequence_from_input(raw: str) -> str:
     return _parse_fasta(s) if ">" in s or "\n" in s else "".join(c for c in s.upper() if c.isalpha())
 
 
-def _predict_hke_single(sequence: str, ligands: list | None = None) -> str:
+def _predict_hke_single(
+    sequence: str,
+    ligands: list | None = None,
+    deadline_sec: float | None = None,
+) -> tuple[str | None, bool]:
     """
-    Run single-chain prediction.
+    Run single-chain prediction. Returns (pdb_str, timed_out).
+    If timed_out is True, pdb_str may still be the best-so-far model (or None if no step completed).
+    """
+    def _over_deadline() -> bool:
+        return deadline_sec is not None and time.time() >= deadline_sec
 
-    Preferred path (when available): 7K00 tunnel extrusion + tree-torque + HKE + optional tree-torque cycle.
-    Fallbacks:
-      - When ligands are present: minimize_full_chain(include_ligands=True) + tree-torque.
-      - When extrusion/HKE cycle helper is unavailable: HKE + tree-torque as before.
-    """
     if ligands:
         result = minimize_full_chain(
             sequence,
@@ -930,7 +1043,7 @@ def _predict_hke_single(sequence: str, ligands: list | None = None) -> str:
                 result = {"backbone_atoms": ref.backbone_atoms, "sequence": ref.sequence, "n_res": ref.n_res, "include_sidechains": False, "ligands": result.get("ligands")}
             except Exception:
                 pass
-        return full_chain_to_pdb(result, chain_id="A", ligands=result.get("ligands"))
+        return (full_chain_to_pdb(result, chain_id="A", ligands=result.get("ligands")), False)
 
     # Prefer full extrusion + HKE + tree-torque cycle when helper and pyhqiv are available.
     if extrude_hke_treetorque_cycle is not None and run_discrete_refinement is not None:
@@ -941,10 +1054,10 @@ def _predict_hke_single(sequence: str, ligands: list | None = None) -> str:
                 max_phases_cap=100000,
                 hke_max_iter_stages=HKE_MAX_ITER,
                 rmsd_threshold=1.0,
+                deadline_sec=deadline_sec,
             )
-            # Sanity-check backbone before building PDB; prepend model line later at send/move time.
             _backbone_sanity_check(cyc.backbone_atoms or [], job_context="(extrude+HKE+tree-torque)")
-            return full_chain_to_pdb(
+            pdb_str = full_chain_to_pdb(
                 {
                     "backbone_atoms": cyc.backbone_atoms,
                     "sequence": cyc.sequence,
@@ -953,10 +1066,13 @@ def _predict_hke_single(sequence: str, ligands: list | None = None) -> str:
                 },
                 chain_id="A",
             )
+            return (pdb_str, bool(cyc.meta.get("timed_out")))
         except Exception as e:
             app.logger.warning("Extrude+HKE+tree-torque cycle failed for single-chain: %s", e)
-            # Fall back to HKE + tree-torque below.
 
+    # Fallback: HKE + tree-torque. Check deadline before starting and before tree-torque.
+    if _over_deadline():
+        return (None, True)
     pos, z_list = minimize_full_chain_hierarchical(
         sequence,
         include_sidechains=False,
@@ -971,6 +1087,8 @@ def _predict_hke_single(sequence: str, ligands: list | None = None) -> str:
     _backbone_sanity_check(result.get("backbone_atoms") or [], job_context="(HKE)")
     backbone = result.get("backbone_atoms")
     seq = result.get("sequence", sequence)
+    if _over_deadline():
+        return (full_chain_to_pdb(result, chain_id="A"), True)
     if run_discrete_refinement and backbone and len(backbone) == 4 * len(seq):
         try:
             ref = run_discrete_refinement(
@@ -982,7 +1100,7 @@ def _predict_hke_single(sequence: str, ligands: list | None = None) -> str:
             result = {"backbone_atoms": ref.backbone_atoms, "sequence": ref.sequence, "n_res": ref.n_res, "include_sidechains": False}
         except Exception:
             pass
-    return full_chain_to_pdb(result, chain_id="A")
+    return (full_chain_to_pdb(result, chain_id="A"), False)
 
 
 def _merge_pdb_chains(result_and_chain_ids: list[tuple[dict, str]]) -> str:
@@ -1067,7 +1185,8 @@ def _predict_hke_assembly_multichain(sequences: list[str]) -> str:
     if not seqs:
         return "MODEL     1\nENDMDL\nEND\n"
     if len(seqs) == 1:
-        return _predict_hke_single(seqs[0], ligands=None)
+        pdb, _ = _predict_hke_single(seqs[0], ligands=None)
+        return pdb or "MODEL     1\nENDMDL\nEND\n"
     if len(seqs) == 2:
         # Prefer full EM-field assembly cycle (HKE + assembly-mode tree-torque + HKE + tree-torque)
         if assembly_hke_treetorque_cycle_two_chains is not None and run_discrete_refinement is not None:
@@ -1321,7 +1440,8 @@ def status():
 
 def _run_job_in_background(job_id: str) -> None:
     """Run prediction for job_id (read from pending .request.json): fast-pass then HKE. On HKE failure, send fast-pass so user gets at least some result."""
-    req_path = os.path.join(PENDING_DIR, f"{job_id}.request.json")
+    base = _find_base_for_job_id(job_id, PENDING_DIR) or job_id
+    req_path = os.path.join(PENDING_DIR, f"{base}.request.json")
     if not os.path.isfile(req_path):
         return
     try:
@@ -1346,6 +1466,7 @@ def _run_job_in_background(job_id: str) -> None:
     try:
         _run_full_job_pipelines(
             job_id=job_id,
+            base=base,
             sequences=sequences,
             seqs=seqs,
             to_email=to_email,

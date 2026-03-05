@@ -2,5 +2,6 @@
 numpy>=1.22
 scipy>=1.9
 
-# Optional: pyhqiv — use for metric math (φ = 2/Θ, γ in horizon/damping)
-# pip install pyhqiv  → horizon_scalar and damping_force_magnitude use pyhqiv
+# Optional but recommended: pyhqiv — metric math (φ, γ, Θ) and tree-torque discrete φ/ψ (pyhqiv.molecular)
+# Required for extrusion + 3-cycle pipeline (run_discrete_refinement). Install with: pip install pyhqiv
+pyhqiv

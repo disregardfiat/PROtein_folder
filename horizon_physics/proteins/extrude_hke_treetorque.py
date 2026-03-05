@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import os
+import signal
+import sys
 import time
 import math
 
@@ -24,8 +26,9 @@ from .assembly_dock import run_two_chain_assembly
 from .temperature_path_search import run_discrete_refinement
 
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PROTEINS_DIR = os.path.join(REPO_ROOT, "proteins")
+# Repo root: horizon_physics/proteins/extrude_hke_treetorque.py -> horizon_physics -> PROtien
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROTEINS_DIR = os.path.join(_REPO_ROOT, "proteins")
 TUNNEL_FIELD_PATH = os.path.join(PROTEINS_DIR, "7K00_tunnel_field.npz")
 
 
@@ -188,35 +191,46 @@ def extrude_and_treetorque(
             meta=meta,
         )
 
-    t1 = time.time()
-    refine = run_discrete_refinement(
-        seq,
-        temperature=temperature,
-        n_steps=200,
-        initial_backbone_atoms=backbone,
-        run_until_converged=True,
-        max_phases_cap=max_phases_cap,
-    )
-    t_tt = time.time() - t1
-    meta["t_treetorque"] = t_tt
-    meta["treetorque_phases"] = len(refine.info.get("phases", []))
-    meta["treetorque_accept"] = refine.n_accept
+    try:
+        t1 = time.time()
+        refine = run_discrete_refinement(
+            seq,
+            temperature=temperature,
+            n_steps=200,
+            initial_backbone_atoms=backbone,
+            run_until_converged=True,
+            max_phases_cap=max_phases_cap,
+        )
+        t_tt = time.time() - t1
+        meta["t_treetorque"] = t_tt
+        meta["treetorque_phases"] = len(refine.info.get("phases", []))
+        meta["treetorque_accept"] = refine.n_accept
 
-    pdb_result = full_chain_to_pdb(
-        {
-            "backbone_atoms": refine.backbone_atoms,
-            "sequence": refine.sequence,
-            "n_res": refine.n_res,
-            "include_sidechains": False,
-        }
-    )
-    return ExtrudeHKETreeResult(
-        sequence=refine.sequence,
-        n_res=refine.n_res,
-        pdb=pdb_result,
-        backbone_atoms=refine.backbone_atoms,
-        meta=meta,
-    )
+        pdb_result = full_chain_to_pdb(
+            {
+                "backbone_atoms": refine.backbone_atoms,
+                "sequence": refine.sequence,
+                "n_res": refine.n_res,
+                "include_sidechains": False,
+            }
+        )
+        return ExtrudeHKETreeResult(
+            sequence=refine.sequence,
+            n_res=refine.n_res,
+            pdb=pdb_result,
+            backbone_atoms=refine.backbone_atoms,
+            meta=meta,
+        )
+    except Exception:
+        # e.g. pyhqiv.molecular not available at call time
+        pdb_str = full_chain_to_pdb(result)
+        return ExtrudeHKETreeResult(
+            sequence=seq,
+            n_res=n_res,
+            pdb=pdb_str,
+            backbone_atoms=backbone,
+            meta=meta,
+        )
 
 
 def hke_from_backbone_once(
@@ -299,6 +313,8 @@ def extrude_hke_treetorque_cycle(
     max_phases_cap: int = 10000,
     hke_max_iter_stages: Tuple[int, int, int] = (15, 25, 50),
     rmsd_threshold: float = 1.0,
+    signal_dump_path: Optional[str] = None,
+    deadline_sec: Optional[float] = None,
 ) -> ExtrudeHKETreeResult:
     """
     Three-cycle pipeline for a single chain:
@@ -306,11 +322,58 @@ def extrude_hke_treetorque_cycle(
     1) Extrude into 7K00 tunnel + free minimize + tree-torque (run_until_converged).
     2) HKE from that backbone (single pass).
     3) If HKE moves the backbone by more than rmsd_threshold (Cα-RMSD), run tree-torque again.
+
+    If signal_dump_path is set, send SIGUSR1 to the process to write the current stage's
+    backbone to that PDB (dump-only, process continues). Use: kill -USR1 <pid>
+
+    If deadline_sec is set (Unix time), before starting each next step we check time.time() >= deadline_sec;
+    if over deadline, return current result with meta["timed_out"] = True and stop.
     """
     from .grade_folds import ca_rmsd
     import tempfile
 
+    def _over_deadline() -> bool:
+        return deadline_sec is not None and time.time() >= deadline_sec
+
+    # Mutable ref for progress dump on SIGUSR1 (dump-only, no exit)
+    _current: Dict[str, Any] = {"backbone_atoms": None, "sequence": None, "n_res": 0, "stage": "init"}
+
+    def _do_signal_dump() -> None:
+        if not signal_dump_path or _current["backbone_atoms"] is None:
+            return
+        bb = _current["backbone_atoms"]
+        seq = _current["sequence"] or ""
+        if not seq or len(bb) != 4 * _current["n_res"]:
+            return
+        try:
+            pdb_str = full_chain_to_pdb(
+                {"backbone_atoms": bb, "sequence": seq, "n_res": _current["n_res"], "include_sidechains": False}
+            )
+            with open(signal_dump_path, "w") as f:
+                f.write(pdb_str)
+            sys.stderr.write(f"Signal dump: wrote {_current['stage']} to {signal_dump_path}\n")
+        except Exception as e:
+            sys.stderr.write(f"Signal dump failed: {e}\n")
+
+    if signal_dump_path and hasattr(signal, "SIGUSR1"):
+        signal.signal(signal.SIGUSR1, lambda _s, _f: _do_signal_dump())
+
     base = extrude_and_treetorque(sequence, temperature=temperature, max_phases_cap=max_phases_cap)
+    if base is not None:
+        _current["backbone_atoms"] = base.backbone_atoms
+        _current["sequence"] = base.sequence
+        _current["n_res"] = base.n_res
+        _current["stage"] = "after_extrude_treetorque"
+        if _over_deadline():
+            meta = dict(base.meta)
+            meta["timed_out"] = True
+            return ExtrudeHKETreeResult(
+                sequence=base.sequence,
+                n_res=base.n_res,
+                pdb=base.pdb,
+                backbone_atoms=base.backbone_atoms,
+                meta=meta,
+            )
     if base is None:
         # Fall back: no tunnel field; use minimize_full_chain + tree-torque only.
         seq = "".join(c for c in sequence.strip().upper() if c.isalpha())
@@ -330,6 +393,10 @@ def extrude_hke_treetorque_cycle(
                 max_phases_cap=max_phases_cap,
             )
             t_tt = time.time() - t1
+            _current["backbone_atoms"] = refine.backbone_atoms
+            _current["sequence"] = refine.sequence
+            _current["n_res"] = refine.n_res
+            _current["stage"] = "after_fallback_treetorque"
             pdb_str = full_chain_to_pdb(
                 {
                     "backbone_atoms": refine.backbone_atoms,
@@ -354,6 +421,29 @@ def extrude_hke_treetorque_cycle(
                     "hke_failed": True,
                 },
             )
+        _current["backbone_atoms"] = backbone
+        _current["sequence"] = seq
+        _current["n_res"] = n_res
+        _current["stage"] = "after_fallback_minimize"
+        if _over_deadline():
+            pdb_str = full_chain_to_pdb(result)
+            return ExtrudeHKETreeResult(
+                sequence=seq,
+                n_res=n_res,
+                pdb=pdb_str,
+                backbone_atoms=backbone,
+                meta={
+                    "sequence": seq,
+                    "n_res": n_res,
+                    "t_minimize": t_min,
+                    "t_treetorque": None,
+                    "t_hke": None,
+                    "treetorque_phases": None,
+                    "treetorque_accept": None,
+                    "hke_failed": True,
+                    "timed_out": True,
+                },
+            )
         pdb_str = full_chain_to_pdb(result)
         return ExtrudeHKETreeResult(
             sequence=seq,
@@ -373,11 +463,25 @@ def extrude_hke_treetorque_cycle(
         )
 
     # HKE from extruded+tree-torque backbone
+    if _over_deadline():
+        meta = dict(base.meta)
+        meta["timed_out"] = True
+        return ExtrudeHKETreeResult(
+            sequence=base.sequence,
+            n_res=base.n_res,
+            pdb=base.pdb,
+            backbone_atoms=base.backbone_atoms,
+            meta=meta,
+        )
     hke_res = hke_from_backbone_once(
         base.sequence,
         base.backbone_atoms,
         max_iter_stages=hke_max_iter_stages,
     )
+    _current["backbone_atoms"] = hke_res.backbone_atoms
+    _current["sequence"] = hke_res.sequence
+    _current["n_res"] = hke_res.n_res
+    _current["stage"] = "after_hke"
 
     # Compare backbone movement via Cα-RMSD
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -396,6 +500,15 @@ def extrude_hke_treetorque_cycle(
     meta_combined = dict(base.meta)
     meta_combined.update(hke_res.meta)
     meta_combined["delta_ca_rmsd_hke_vs_treetorque"] = delta_rmsd
+
+    if _over_deadline():
+        return ExtrudeHKETreeResult(
+            sequence=hke_res.sequence,
+            n_res=hke_res.n_res,
+            pdb=hke_res.pdb,
+            backbone_atoms=hke_res.backbone_atoms,
+            meta={**meta_combined, "timed_out": True},
+        )
 
     # If HKE did not move much, return HKE result (already in a basin)
     if not math.isfinite(delta_rmsd) or delta_rmsd <= rmsd_threshold:
@@ -417,6 +530,15 @@ def extrude_hke_treetorque_cycle(
             meta=meta_combined,
         )
 
+    if _over_deadline():
+        return ExtrudeHKETreeResult(
+            sequence=hke_res.sequence,
+            n_res=hke_res.n_res,
+            pdb=hke_res.pdb,
+            backbone_atoms=hke_res.backbone_atoms,
+            meta={**meta_combined, "timed_out": True},
+        )
+
     t2 = time.time()
     refine2 = run_discrete_refinement(
         hke_res.sequence,
@@ -427,6 +549,10 @@ def extrude_hke_treetorque_cycle(
         max_phases_cap=max_phases_cap,
     )
     t_tt2 = time.time() - t2
+    _current["backbone_atoms"] = refine2.backbone_atoms
+    _current["sequence"] = refine2.sequence
+    _current["n_res"] = refine2.n_res
+    _current["stage"] = "after_treetorque_2"
     meta_combined["t_treetorque_2"] = t_tt2
     meta_combined["treetorque_2_phases"] = len(refine2.info.get("phases", []))
     meta_combined["treetorque_2_accept"] = refine2.n_accept

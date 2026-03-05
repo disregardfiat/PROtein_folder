@@ -17,10 +17,11 @@ from __future__ import annotations
 import numpy as np
 from typing import List, Optional, Tuple, Sequence
 
-from ._hqiv_base import theta_for_atom
+from ._hqiv_base import bond_length_from_theta, theta_for_atom
 from .casp_submission import _parse_fasta, _place_backbone_ca, _place_full_backbone, AA_1to3
 from .secondary_structure_predictor import predict_ss
 from .peptide_backbone import backbone_bond_lengths
+from .folding_energy import K_BOND_EM_RELAX
 
 # Z_shell for folding_energy (Cα)
 _Z_CA = 6
@@ -70,12 +71,44 @@ def _radius_from_theta(symbol: str, coordination: int = 1) -> float:
     return max(0.5, theta * 0.5)
 
 
-# Simple partial charges for backbone (N, CA, C, O)
+def equilibrium_bond_length_ang(prev_name: str, curr_name: str, bonds: Optional[dict] = None) -> float:
+    """
+    Equilibrium bond length (Å) for backbone pair (prev, curr). No constants:
+    uses backbone_bond_lengths() from peptide_backbone (pyhqiv Θ-derived).
+    """
+    if bonds is None:
+        bonds = backbone_bond_lengths()
+    prev, curr = (prev_name or "C").strip().upper(), (curr_name or "C").strip().upper()
+    if prev == "N" and curr == "CA":
+        return float(bonds["N_Calpha"])
+    if prev == "CA" and curr == "C":
+        return float(bonds["Calpha_C"])
+    if prev == "C" and curr == "O":
+        return float(bonds["C_O"])
+    if prev == "C" and curr == "N":
+        return float(bonds["C_N"])
+    if prev == "CA" and curr == "N":
+        return float(bonds["N_Calpha"])
+    # Fallback: use Θ from pyhqiv for both atoms
+    s_prev = prev[0] if prev else "C"
+    s_curr = curr[0] if curr else "C"
+    return float(bond_length_from_theta(theta_for_atom(s_prev, 2), theta_for_atom(s_curr, 2), 1.0))
+
+
+# Coupling label: +, -, ++, -- per atom (coupling point for torsion/coupling DOFs). From pyhqiv when available.
+CouplingLabel = Optional[str]  # "+", "-", "++", "--", or None
+
+# Simple partial charges for backbone (N, CA, C, O) — from physics; could move to pyhqiv
 _BACKBONE_CHARGE = {"N": -0.3, "CA": 0.0, "C": 0.5, "O": -0.5}
 
 
 class Atom:
-    """Every atom stays a full class. Radius and Θ from pyhqiv when available."""
+    """
+    Backbone atom with position, radius/Θ from pyhqiv, and optional coupling label.
+    Allowed angles for bonds come from pyhqiv (discrete_dof / coupling_angle_energy_profile);
+    theta_local is the Θ (Å) at this atom for use in allowed-angle profiles.
+    coupling_label: "+", "-", "++", or "--" acting as coupling point (from pyhqiv when available).
+    """
 
     def __init__(
         self,
@@ -85,6 +118,8 @@ class Atom:
         pos: np.ndarray,
         charge: Optional[float] = None,
         radius: Optional[float] = None,
+        theta_local: Optional[float] = None,
+        coupling_label: CouplingLabel = None,
     ):
         self.name = name
         self.resname = resname
@@ -93,6 +128,10 @@ class Atom:
         symbol = name[0] if name else "C"
         self.charge = charge if charge is not None else _BACKBONE_CHARGE.get(name, 0.0)
         self.radius = radius if radius is not None else _radius_from_theta(symbol)
+        # Θ (Å) at this atom — from pyhqiv theta_for_atom; used for allowed-angle profiles
+        self.theta_local = theta_local if theta_local is not None else theta_for_atom(symbol, 2)
+        # Coupling point for torsion/coupling DOFs: +, -, ++, -- (from pyhqiv when available)
+        self.coupling_label = coupling_label
 
     def __repr__(self) -> str:
         return f"{self.name}{self.resid}@{self.pos.round(2)}"
@@ -346,18 +385,18 @@ class CoTranslationalAssembler:
         n = len(self.atoms)
         positions = np.array([a.pos for a in self.atoms])
         forces = self.field.forces_at_all(positions)
-        # Bond constraint
+        # Bond constraint: r_eq from pyhqiv (backbone_bond_lengths); spring from K_BOND
         bonds = backbone_bond_lengths()
-        r_n_ca, r_ca_c, r_c_o = bonds["N_Calpha"], bonds["Calpha_C"], bonds["C_O"]
+        k_bond_em = float(K_BOND_EM_RELAX)  # eV/Å² for EM relax step; from pyhqiv when available
         for i, a in enumerate(self.atoms):
             prev_idx = i - 3 if a.name == "N" and i >= 3 else (i - 1 if i > 0 else -1)
             if prev_idx >= 0:
                 prev = self.atoms[prev_idx]
                 bond_vec = prev.pos - a.pos
                 dist = np.linalg.norm(bond_vec)
-                r_eq = 1.33 if prev.name in ("C", "N") else (1.53 if prev.name == "CA" else 1.23)
+                r_eq = equilibrium_bond_length_ang(prev.name, a.name, bonds)
                 if dist > 1e-9 and dist > r_eq * 1.15:
-                    forces[i] += 2.5 * (dist - r_eq) * bond_vec / dist
+                    forces[i] += k_bond_em * (dist - r_eq) * bond_vec / dist
             if not free_fold and n - i < rebound_tail:
                 forces[i] = forces[i] + 1.2 * self.tunnel_axis
 
