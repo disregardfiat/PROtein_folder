@@ -93,7 +93,14 @@ USE_FAST_PREDICT = os.environ.get("USE_FAST_PREDICT", "").strip().lower() in ("1
 LIGAND_KEY = os.environ.get("CASP_LIGAND_KEY", "ligand")
 FUNNEL_RADIUS = float(os.environ.get("FUNNEL_RADIUS", "10.0"))
 FUNNEL_RADIUS_EXIT = float(os.environ.get("FUNNEL_RADIUS_EXIT", "20.0"))
-# HKE uses finite-difference gradient (2 * n_dofs evals per step; ~572/step for 141 res). Funnel is on; bottleneck is FD, not funnel. Lower iters so server runs finish in ~10–20 min per chain.
+# HKE uses finite-difference gradient (2 * n_dofs evals per step; ~572/step for 141 res). Funnel is on; bottleneck is FD, not funnel.
+# Main pipeline: do ONE short minimizing pass in HKE, then hand off to tree-torque (faster) to see if anything changed.
+HKE_ONE_PASS_ITER = (
+    int(os.environ.get("HKE_ONE_PASS_S1", "2")),
+    int(os.environ.get("HKE_ONE_PASS_S2", "3")),
+    int(os.environ.get("HKE_ONE_PASS_S3", "5")),
+)
+# Legacy / fast-pass: can use higher iters for quick geometric fold (Phase 1).
 HKE_MAX_ITER = (
     int(os.environ.get("HKE_MAX_ITER_S1", "15")),
     int(os.environ.get("HKE_MAX_ITER_S2", "25")),
@@ -1057,14 +1064,21 @@ def process_pending_jobs() -> None:
             "attempts": attempts,
         })
 
-    # Handle max-attempts jobs: send failure to CC, move .txt to failed (fast-pass already sent in Phase 1)
+    # Handle max-attempts jobs: send failure to CC, move .txt to failed (fast-pass already sent in Phase 1).
+    # This runs only at startup; the email is sent when we find a job in *pending* with attempts>=2
+    # (e.g. job failed twice and was moved to .failed.txt, then someone reset by copying .failed.txt
+    # back to pending but left attempts=2, then server restarted).
     for j in jobs:
         if j["attempts"] >= MAX_ATTEMPTS:
             _send_failure_email(j["to_email"], j["job_id"], j["job_title"])
             try:
                 shutil.move(j["txt_path"], os.path.join(OUTPUTS_DIR, f"{j['base']}.failed.txt"))
             except Exception:
-                pass
+                # If move fails, rename in place so we don't re-send this email on every restart
+                try:
+                    os.rename(j["txt_path"], j["txt_path"] + ".failed")
+                except Exception:
+                    pass
     jobs = [j for j in jobs if j["attempts"] < MAX_ATTEMPTS]
 
     # Phase 1: one thread per job missing .fast.pdb (fast-pass in parallel)
@@ -1185,7 +1199,7 @@ def _predict_hke_single(
                 sequence,
                 temperature=310.0,
                 max_phases_cap=100000,
-                hke_max_iter_stages=HKE_MAX_ITER,
+                hke_max_iter_stages=HKE_ONE_PASS_ITER,
                 rmsd_threshold=1.0,
                 deadline_sec=deadline_sec,
             )
@@ -1212,9 +1226,9 @@ def _predict_hke_single(
         funnel_radius=FUNNEL_RADIUS,
         funnel_stiffness=1.0,
         funnel_radius_exit=FUNNEL_RADIUS_EXIT,
-        max_iter_stage1=HKE_MAX_ITER[0],
-        max_iter_stage2=HKE_MAX_ITER[1],
-        max_iter_stage3=HKE_MAX_ITER[2],
+        max_iter_stage1=HKE_ONE_PASS_ITER[0],
+        max_iter_stage2=HKE_ONE_PASS_ITER[1],
+        max_iter_stage3=HKE_ONE_PASS_ITER[2],
     )
     result = hierarchical_result_for_pdb(pos, z_list, sequence, include_sidechains=False)
     _backbone_sanity_check(result.get("backbone_atoms") or [], job_context="(HKE)")
@@ -1296,9 +1310,9 @@ def _predict_hke_assembly(sequences: list[str]) -> str:
             funnel_radius=FUNNEL_RADIUS,
             funnel_stiffness=1.0,
             funnel_radius_exit=FUNNEL_RADIUS_EXIT,
-            max_iter_stage1=HKE_MAX_ITER[0],
-            max_iter_stage2=HKE_MAX_ITER[1],
-            max_iter_stage3=HKE_MAX_ITER[2],
+            max_iter_stage1=HKE_ONE_PASS_ITER[0],
+            max_iter_stage2=HKE_ONE_PASS_ITER[1],
+            max_iter_stage3=HKE_ONE_PASS_ITER[2],
         )
         result = hierarchical_result_for_pdb(pos, z_list, seq, include_sidechains=False)
         _backbone_sanity_check(result.get("backbone_atoms") or [], job_context="(HKE assembly)")
@@ -1327,7 +1341,7 @@ def _predict_hke_assembly_multichain(sequences: list[str]) -> str:
                 cyc = assembly_hke_treetorque_cycle_two_chains(
                     seqs[0],
                     seqs[1],
-                    hke_max_iter_stages=HKE_MAX_ITER,
+                    hke_max_iter_stages=HKE_ONE_PASS_ITER,
                     rmsd_threshold=1.0,
                 )
                 return cyc.pdb_complex
@@ -1344,9 +1358,9 @@ def _predict_hke_assembly_multichain(sequences: list[str]) -> str:
         funnel_radius=FUNNEL_RADIUS,
         funnel_radius_exit=FUNNEL_RADIUS_EXIT,
         funnel_stiffness=1.0,
-        hke_max_iter_s1=HKE_MAX_ITER[0],
-        hke_max_iter_s2=HKE_MAX_ITER[1],
-        hke_max_iter_s3=HKE_MAX_ITER[2],
+        hke_max_iter_s1=HKE_ONE_PASS_ITER[0],
+        hke_max_iter_s2=HKE_ONE_PASS_ITER[1],
+        hke_max_iter_s3=HKE_ONE_PASS_ITER[2],
         converge_max_disp_per_100_res=1.0,
         max_dock_iter=600,
     )
@@ -1362,9 +1376,9 @@ def _predict_hke_assembly_multichain(sequences: list[str]) -> str:
             funnel_radius=FUNNEL_RADIUS,
             funnel_stiffness=1.0,
             funnel_radius_exit=FUNNEL_RADIUS_EXIT,
-            max_iter_stage1=HKE_MAX_ITER[0],
-            max_iter_stage2=HKE_MAX_ITER[1],
-            max_iter_stage3=HKE_MAX_ITER[2],
+            max_iter_stage1=HKE_ONE_PASS_ITER[0],
+            max_iter_stage2=HKE_ONE_PASS_ITER[1],
+            max_iter_stage3=HKE_ONE_PASS_ITER[2],
         )
         result_c = hierarchical_result_for_pdb(pos, z_list, seqs[i], include_sidechains=False)
         _backbone_sanity_check(result_c.get("backbone_atoms") or [], job_context="(HKE assembly C)")
@@ -1450,9 +1464,9 @@ def _predict_hke_assembly_with_complex(sequences: list[str]) -> tuple[str, str, 
         funnel_radius=FUNNEL_RADIUS,
         funnel_radius_exit=FUNNEL_RADIUS_EXIT,
         funnel_stiffness=1.0,
-        hke_max_iter_s1=HKE_MAX_ITER[0],
-        hke_max_iter_s2=HKE_MAX_ITER[1],
-        hke_max_iter_s3=HKE_MAX_ITER[2],
+        hke_max_iter_s1=HKE_ONE_PASS_ITER[0],
+        hke_max_iter_s2=HKE_ONE_PASS_ITER[1],
+        hke_max_iter_s3=HKE_ONE_PASS_ITER[2],
         converge_max_disp_per_100_res=1.0,
         max_dock_iter=600,
     )
