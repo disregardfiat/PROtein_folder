@@ -17,7 +17,9 @@ import os
 import random
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import zipfile
@@ -841,6 +843,135 @@ def _run_hke_only(
         )
 
 
+def _run_hke_from_temp_file(temp_path: str) -> None:
+    """Entry point for subprocess: read job payload from temp_path and run _run_hke_only. Used for wall-clock timeout."""
+    with open(temp_path) as f:
+        payload = json.load(f)
+    ligand_str = (payload.get("ligand_str") or "").strip()
+    parsed_ligands = parse_ligands(ligand_str) if ligand_str else []
+    _run_hke_only(
+        payload["job_id"],
+        payload["base"],
+        payload["sequences"],
+        payload["seqs"],
+        payload.get("to_email"),
+        payload.get("job_title"),
+        parsed_ligands,
+    )
+
+
+def _run_hke_only_with_timeout(
+    job_id: str,
+    base: str,
+    sequences: list[str],
+    seqs: list[str],
+    to_email: str | None,
+    job_title: str | None,
+    ligand_str: str,
+) -> None:
+    """
+    Run _run_hke_only in a subprocess with wall-clock timeout. If the subprocess exceeds
+    PREDICTION_TIMEOUT_SEC, we kill it and send the fast-pass result so the user gets something.
+    """
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    payload = {
+        "job_id": job_id,
+        "base": base,
+        "sequences": sequences,
+        "seqs": seqs,
+        "to_email": to_email,
+        "job_title": job_title,
+        "ligand_str": ligand_str or "",
+    }
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(payload, f)
+        temp_path = f.name
+    try:
+        cmd = [
+            sys.executable,
+            "-c",
+            "import sys, os; sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); "
+            "import json; exec(open(sys.argv[1]).read()); __run(__import__('casp_server').__dict__)",
+        ]
+        # Simpler: run a script that imports and calls
+        run_cmd = [
+            sys.executable,
+            "-c",
+            "import sys, os, json\n"
+            "sys.path.insert(0, %r)\n"
+            "with open(sys.argv[1]) as f: payload = json.load(f)\n"
+            "from casp_server import parse_ligands, _run_hke_only\n"
+            "pl = parse_ligands(payload.get('ligand_str') or '') if payload.get('ligand_str') else []\n"
+            "_run_hke_only(payload['job_id'], payload['base'], payload['sequences'], payload['seqs'], "
+            "payload.get('to_email'), payload.get('job_title'), pl)\n" % repo_root,
+            temp_path,
+        ]
+        try:
+            subprocess.run(
+                run_cmd,
+                cwd=repo_root,
+                timeout=PREDICTION_TIMEOUT_SEC,
+                check=True,
+            )
+        except subprocess.TimeoutExpired:
+            app.logger.warning(
+                "Job %s hit wall-clock timeout (%ds); sending fast-pass result.",
+                job_id,
+                PREDICTION_TIMEOUT_SEC,
+            )
+            fast_path = os.path.join(PENDING_DIR, f"{base}.fast.pdb")
+            if not os.path.isfile(fast_path):
+                raise FileNotFoundError(f"No fast.pdb for timed-out job {job_id}")
+            with open(fast_path) as fp:
+                fast_pdb = fp.read()
+            fast_pdb = _prepend_pdb_model_line(fast_pdb)
+            ok, reason = _pdb_sanity_check(fast_pdb)
+            if not ok:
+                raise ValueError(f"Fast-pass PDB sanity check failed after timeout: {reason}")
+            _move_to_outputs(base, fast_pdb)
+            try:
+                if os.path.isfile(fast_path):
+                    shutil.move(fast_path, os.path.join(OUTPUTS_DIR, f"{base}.fast.pdb"))
+            except Exception:
+                pass
+            try:
+                models_path = os.path.join(OUTPUTS_DIR, f"{base}.models.json")
+                record = {
+                    "job_id": job_id,
+                    "title": job_title,
+                    "email": to_email,
+                    "timed_out": True,
+                    "models": [
+                        {"name": "Prediction1.pdb", "stage": "fast", "type": "fast", "file": f"{base}.pdb"},
+                        {"name": "Prediction2.pdb", "stage": "fast", "type": "fast", "file": f"{base}.fast.pdb"},
+                    ],
+                }
+                with open(models_path, "w") as f:
+                    json.dump(record, f)
+            except Exception as e:
+                app.logger.warning("Failed to write models.json after timeout: %s", e)
+            body_extra = (
+                f"This prediction was stopped after the {PREDICTION_TIMEOUT_SEC // 3600}-hour time limit. "
+                "The attached model is the fast-pass (quick fold) result."
+            )
+            if to_email:
+                _send_pdb_email_multi(
+                    to_email,
+                    models=[
+                        ("Prediction1.pdb", fast_pdb),
+                        ("Prediction2.pdb", fast_pdb),
+                    ],
+                    title=job_title,
+                    body_extra=body_extra,
+                )
+    finally:
+        try:
+            os.unlink(temp_path)
+        except Exception:
+            pass
+
+
 def _run_full_job_pipelines(
     job_id: str,
     base: str,
@@ -922,6 +1053,7 @@ def process_pending_jobs() -> None:
             "to_email": to_email,
             "job_title": job_title,
             "parsed_ligands": parsed_ligands,
+            "ligand_str": ligand_str,
             "attempts": attempts,
         })
 
@@ -982,8 +1114,9 @@ def process_pending_jobs() -> None:
                 len(j["parsed_ligands"]),
             )
         try:
-            _run_hke_only(
-                j["job_id"], j["base"], j["sequences"], j["seqs"], j["to_email"], j["job_title"], j["parsed_ligands"]
+            _run_hke_only_with_timeout(
+                j["job_id"], j["base"], j["sequences"], j["seqs"], j["to_email"], j["job_title"],
+                j.get("ligand_str", "") or "",
             )
         except Exception as e:
             app.logger.warning("Pending job %s HKE failed: %s", j["job_id"], e)
