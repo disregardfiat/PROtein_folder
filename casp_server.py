@@ -17,6 +17,7 @@ import os
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -914,14 +915,33 @@ def _run_hke_only_with_timeout(
             "payload.get('to_email'), payload.get('job_title'), pl)\n" % repo_root,
             temp_path,
         ]
+        proc = subprocess.Popen(
+            run_cmd,
+            cwd=repo_root,
+            start_new_session=True,
+        )
         try:
-            subprocess.run(
-                run_cmd,
-                cwd=repo_root,
-                timeout=PREDICTION_TIMEOUT_SEC,
-                check=True,
-            )
+            proc.wait(timeout=PREDICTION_TIMEOUT_SEC)
+            if proc.returncode != 0:
+                raise subprocess.CalledProcessError(proc.returncode, run_cmd)
         except subprocess.TimeoutExpired:
+            # Kill entire process group so any child processes (e.g. from JAX/threading) also stop.
+            if hasattr(os, "killpg"):
+                try:
+                    pgid = os.getpgid(proc.pid)
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+            else:
+                proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
             app.logger.warning(
                 "Job %s hit wall-clock timeout (%ds); sending fast-pass result.",
                 job_id,
