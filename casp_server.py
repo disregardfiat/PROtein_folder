@@ -868,6 +868,192 @@ def _run_hke_from_temp_file(temp_path: str) -> None:
     )
 
 
+def _run_one_job_fast_then_hke(temp_path: str) -> None:
+    """
+    Entry point for subprocess: run fast-pass (if .fast.pdb missing) then HKE for one job.
+    Entire job is in one process so a 1h wall-clock timeout covers both; on timeout parent sends fast-pass.
+    """
+    with open(temp_path) as f:
+        payload = json.load(f)
+    job_id = payload["job_id"]
+    base = payload["base"]
+    sequences = payload["sequences"]
+    seqs = payload["seqs"]
+    to_email = payload.get("to_email")
+    job_title = payload.get("job_title")
+    ligand_str = (payload.get("ligand_str") or "").strip()
+    parsed_ligands = parse_ligands(ligand_str) if ligand_str else []
+    fast_path = os.path.join(PENDING_DIR, f"{base}.fast.pdb")
+    if not os.path.isfile(fast_path):
+        _run_fast_pass_only(job_id, base, sequences, seqs, to_email, job_title)
+    _run_hke_only(job_id, base, sequences, seqs, to_email, job_title, parsed_ligands)
+
+
+def _run_one_job_with_timeout(
+    job_id: str,
+    base: str,
+    sequences: list[str],
+    seqs: list[str],
+    to_email: str | None,
+    job_title: str | None,
+    ligand_str: str,
+    txt_path: str,
+    attempts: int,
+) -> None:
+    """
+    Run one job (fast-pass if needed + HKE) in a subprocess with PREDICTION_TIMEOUT_SEC wall clock.
+    After 1h we kill the process and send fast-pass so the user always gets a result.
+    On failure: increment attempts, send failure email; if attempts >= MAX_ATTEMPTS move to .failed.txt.
+    """
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    payload = {
+        "job_id": job_id,
+        "base": base,
+        "sequences": sequences,
+        "seqs": seqs,
+        "to_email": to_email,
+        "job_title": job_title,
+        "ligand_str": ligand_str or "",
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(payload, f)
+        temp_path = f.name
+    run_cmd = [
+        sys.executable,
+        "-c",
+        "import sys, os, json\n"
+        "sys.path.insert(0, %r)\n"
+        "with open(sys.argv[1]) as f: payload = json.load(f)\n"
+        "from casp_server import _run_one_job_fast_then_hke\n"
+        "_run_one_job_fast_then_hke(sys.argv[1])\n" % repo_root,
+        temp_path,
+    ]
+    try:
+        proc = subprocess.Popen(
+            run_cmd,
+            cwd=repo_root,
+            start_new_session=True,
+        )
+        try:
+            proc.wait(timeout=PREDICTION_TIMEOUT_SEC)
+            if proc.returncode != 0:
+                raise subprocess.CalledProcessError(proc.returncode, run_cmd)
+        except subprocess.TimeoutExpired:
+            if hasattr(os, "killpg"):
+                try:
+                    pgid = os.getpgid(proc.pid)
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+            else:
+                proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            app.logger.warning(
+                "Job %s hit wall-clock timeout (%ds); sending fast-pass result.",
+                job_id,
+                PREDICTION_TIMEOUT_SEC,
+            )
+            fast_path = os.path.join(PENDING_DIR, f"{base}.fast.pdb")
+            if not os.path.isfile(fast_path):
+                _update_pending_attempts(txt_path, attempts + 1)
+                if to_email:
+                    _send_job_failure_email(
+                        to_email,
+                        job_id,
+                        job_title,
+                        f"Prediction timed out after {PREDICTION_TIMEOUT_SEC // 3600}h before initial fold completed.",
+                    )
+                if attempts + 1 >= MAX_ATTEMPTS:
+                    try:
+                        shutil.move(txt_path, os.path.join(OUTPUTS_DIR, f"{base}.failed.txt"))
+                    except Exception:
+                        pass
+                return
+            with open(fast_path) as fp:
+                fast_pdb = fp.read()
+            fast_pdb = _prepend_pdb_model_line(fast_pdb)
+            ok, reason = _pdb_sanity_check(fast_pdb)
+            if not ok:
+                _update_pending_attempts(txt_path, attempts + 1)
+                if to_email:
+                    _send_job_failure_email(to_email, job_id, job_title, f"Fast-pass sanity check failed after timeout: {reason}")
+                if attempts + 1 >= MAX_ATTEMPTS:
+                    try:
+                        shutil.move(txt_path, os.path.join(OUTPUTS_DIR, f"{base}.failed.txt"))
+                    except Exception:
+                        pass
+                return
+            _move_to_outputs(base, fast_pdb)
+            try:
+                if os.path.isfile(fast_path):
+                    shutil.move(fast_path, os.path.join(OUTPUTS_DIR, f"{base}.fast.pdb"))
+            except Exception:
+                pass
+            try:
+                models_path = os.path.join(OUTPUTS_DIR, f"{base}.models.json")
+                record = {
+                    "job_id": job_id,
+                    "title": job_title,
+                    "email": to_email,
+                    "timed_out": True,
+                    "models": [
+                        {"name": "Prediction1.pdb", "stage": "fast", "type": "fast", "file": f"{base}.pdb"},
+                        {"name": "Prediction2.pdb", "stage": "fast", "type": "fast", "file": f"{base}.fast.pdb"},
+                    ],
+                }
+                with open(models_path, "w") as f:
+                    json.dump(record, f)
+            except Exception as e:
+                app.logger.warning("Failed to write models.json after timeout: %s", e)
+            body_extra = (
+                f"This prediction was stopped after the {PREDICTION_TIMEOUT_SEC // 3600}-hour time limit. "
+                "The attached model is the fast-pass (quick fold) result."
+            )
+            if to_email:
+                _send_pdb_email_multi(
+                    to_email,
+                    models=[
+                        ("Prediction1.pdb", fast_pdb),
+                        ("Prediction2.pdb", fast_pdb),
+                    ],
+                    title=job_title,
+                    body_extra=body_extra,
+                )
+    except subprocess.CalledProcessError:
+        new_attempts = attempts + 1
+        _update_pending_attempts(txt_path, new_attempts)
+        if to_email:
+            _send_job_failure_email(to_email, job_id, job_title, "HKE subprocess exited with error.")
+        if new_attempts >= MAX_ATTEMPTS:
+            try:
+                shutil.move(txt_path, os.path.join(OUTPUTS_DIR, f"{base}.failed.txt"))
+            except Exception:
+                pass
+    except Exception as e:
+        app.logger.warning("Pending job %s failed: %s", job_id, e)
+        new_attempts = attempts + 1
+        _update_pending_attempts(txt_path, new_attempts)
+        if to_email:
+            _send_job_failure_email(to_email, job_id, job_title, str(e))
+        if new_attempts >= MAX_ATTEMPTS:
+            try:
+                shutil.move(txt_path, os.path.join(OUTPUTS_DIR, f"{base}.failed.txt"))
+            except Exception:
+                pass
+    finally:
+        try:
+            os.unlink(temp_path)
+        except Exception:
+            pass
+
+
 def _run_hke_only_with_timeout(
     job_id: str,
     base: str,
@@ -1018,10 +1204,9 @@ def _run_full_job_pipelines(
 
 def process_pending_jobs() -> None:
     """
-    Two-phase queue on startup; one thread per fold.
-    Phase 1: One thread per job missing .fast.pdb (fast-pass in parallel); join before Phase 2.
-    Phase 2: One thread per job that has .fast.pdb (HKE + tree-torque in parallel, no join).
-    On HKE failure: increment attempts; send fast-pass to requester so they get at least some result.
+    On startup: one thread per pending job. Each job runs in a subprocess with 1h wall-clock
+    timeout (fast-pass if needed, then HKE). After 1h we kill the process and send fast-pass
+    so the user always gets a result. No blocking join — no single job can block the rest.
     """
     _ensure_output_dirs()
     if not os.path.isdir(PENDING_DIR):
@@ -1101,72 +1286,29 @@ def process_pending_jobs() -> None:
                     pass
     jobs = [j for j in jobs if j["attempts"] < MAX_ATTEMPTS]
 
-    # Phase 1: one thread per job missing .fast.pdb (fast-pass in parallel)
-    def _run_one_fast_pass(j: dict) -> None:
-        fast_path = os.path.join(PENDING_DIR, f"{j['base']}.fast.pdb")
-        if os.path.isfile(fast_path):
-            return
+    # One thread per job: each job runs in a subprocess with 1h wall-clock timeout (fast-pass + HKE).
+    # After 1h we kill the process and send fast-pass so the user always gets a result.
+    def _run_one_job(j: dict) -> None:
         if j["parsed_ligands"]:
             app.logger.info(
                 "Ligand detected via key %s → %d ligands added as 6-DOF agents",
                 LIGAND_KEY,
                 len(j["parsed_ligands"]),
             )
-        try:
-            _run_fast_pass_only(
-                j["job_id"], j["base"], j["sequences"], j["seqs"], j["to_email"], j["job_title"]
-            )
-        except Exception as e:
-            app.logger.warning("Pending job %s fast-pass failed: %s", j["job_id"], e)
+        _run_one_job_with_timeout(
+            j["job_id"],
+            j["base"],
+            j["sequences"],
+            j["seqs"],
+            j["to_email"],
+            j["job_title"],
+            j.get("ligand_str", "") or "",
+            j["txt_path"],
+            j["attempts"],
+        )
 
-    phase1_threads = []
     for j in jobs:
-        t = threading.Thread(target=_run_one_fast_pass, args=(j,), daemon=True)
-        t.start()
-        phase1_threads.append(t)
-    for t in phase1_threads:
-        t.join()
-
-    # Phase 2: one thread per fold — prefer single-chain, then by .fast.pdb size
-    hke_jobs = []
-    for j in jobs:
-        fast_path = os.path.join(PENDING_DIR, f"{j['base']}.fast.pdb")
-        out_pdb = os.path.join(OUTPUTS_DIR, f"{j['base']}.pdb")
-        if os.path.isfile(fast_path) and not os.path.isfile(out_pdb):
-            size = os.path.getsize(fast_path)
-            # Prefer single-chain (1) over assembly (0); then smallest first
-            single_chain = 1 if len(j["seqs"]) == 1 else 0
-            hke_jobs.append((single_chain, size, j))
-    hke_jobs.sort(key=lambda x: (-x[0], x[1]))  # single-chain first, then by size
-
-    def _run_one_hke_job(j: dict) -> None:
-        """Run HKE + tree-torque for one job; update attempts and move to failed on exception."""
-        if j["parsed_ligands"]:
-            app.logger.info(
-                "Ligand detected via key %s → %d ligands added as 6-DOF agents",
-                LIGAND_KEY,
-                len(j["parsed_ligands"]),
-            )
-        try:
-            _run_hke_only_with_timeout(
-                j["job_id"], j["base"], j["sequences"], j["seqs"], j["to_email"], j["job_title"],
-                j.get("ligand_str", "") or "",
-            )
-        except Exception as e:
-            app.logger.warning("Pending job %s HKE failed: %s", j["job_id"], e)
-            new_attempts = j["attempts"] + 1
-            _update_pending_attempts(j["txt_path"], new_attempts)
-            # Always notify requester and CC on failure (e.g. sanity check or HKE error)
-            if j["to_email"]:
-                _send_job_failure_email(j["to_email"], j["job_id"], j["job_title"], str(e))
-            if new_attempts >= MAX_ATTEMPTS:
-                try:
-                    shutil.move(j["txt_path"], os.path.join(OUTPUTS_DIR, f"{j['base']}.failed.txt"))
-                except Exception:
-                    pass
-
-    for _single, _size, j in hke_jobs:
-        threading.Thread(target=_run_one_hke_job, args=(j,), daemon=True).start()
+        threading.Thread(target=_run_one_job, args=(j,), daemon=True).start()
 
 
 def _sequence_from_input(raw: str) -> str:
