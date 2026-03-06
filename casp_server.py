@@ -1748,9 +1748,10 @@ def status():
 
 
 def _run_job_in_background(job_id: str) -> None:
-    """Run prediction for job_id (read from pending .request.json): fast-pass then HKE. On HKE failure, send fast-pass so user gets at least some result."""
+    """Run prediction for job_id in a subprocess with 1h timeout; on timeout or failure, send fast-pass or failure email."""
     base = _find_base_for_job_id(job_id, PENDING_DIR) or job_id
     req_path = os.path.join(PENDING_DIR, f"{base}.request.json")
+    txt_path = os.path.join(PENDING_DIR, f"{base}.txt")
     if not os.path.isfile(req_path):
         return
     try:
@@ -1772,19 +1773,21 @@ def _run_job_in_background(job_id: str) -> None:
             LIGAND_KEY,
             len(parsed_ligands),
         )
+    attempts = _read_pending_attempts(txt_path) if os.path.isfile(txt_path) else 0
     try:
-        _run_full_job_pipelines(
+        _run_one_job_with_timeout(
             job_id=job_id,
             base=base,
             sequences=sequences,
             seqs=seqs,
             to_email=to_email,
             job_title=job_title,
-            parsed_ligands=parsed_ligands,
+            ligand_str=ligand_str,
+            txt_path=txt_path,
+            attempts=attempts,
         )
     except Exception as e:
         app.logger.warning("Background job %s failed: %s", job_id, e)
-        # Fast-pass already sent by _run_fast_pass_only; no duplicate email
         _send_job_failure_email(to_email, job_id, job_title, str(e))
 
 
