@@ -937,6 +937,7 @@ def _run_one_job_with_timeout_impl(
         "job_title": job_title,
         "ligand_str": ligand_str or "",
     }
+    _run_one_job_subprocess_error = ""
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         json.dump(payload, f)
         temp_path = f.name
@@ -955,10 +956,17 @@ def _run_one_job_with_timeout_impl(
             run_cmd,
             cwd=repo_root,
             start_new_session=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
         try:
             proc.wait(timeout=PREDICTION_TIMEOUT_SEC)
             if proc.returncode != 0:
+                err_out = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
+                out_out = proc.stdout.read().decode("utf-8", errors="replace") if proc.stdout else ""
+                _run_one_job_subprocess_error = (err_out.strip() or out_out.strip() or "exit code %s" % proc.returncode)
+                if len(_run_one_job_subprocess_error) > 2000:
+                    _run_one_job_subprocess_error = "...\n" + _run_one_job_subprocess_error[-2000:]
                 raise subprocess.CalledProcessError(proc.returncode, run_cmd)
         except subprocess.TimeoutExpired:
             if hasattr(os, "killpg"):
@@ -1048,11 +1056,12 @@ def _run_one_job_with_timeout_impl(
                     title=job_title,
                     body_extra=body_extra,
                 )
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as e:
         new_attempts = attempts + 1
         _update_pending_attempts(txt_path, new_attempts)
+        err_msg = _run_one_job_subprocess_error.strip() if _run_one_job_subprocess_error else "HKE subprocess exited with error (code %s)." % getattr(e, "returncode", "?")
         if to_email:
-            _send_job_failure_email(to_email, job_id, job_title, "HKE subprocess exited with error.")
+            _send_job_failure_email(to_email, job_id, job_title, err_msg)
         if new_attempts >= MAX_ATTEMPTS:
             try:
                 shutil.move(txt_path, os.path.join(OUTPUTS_DIR, f"{base}.failed.txt"))
