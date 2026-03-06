@@ -4,7 +4,7 @@ POST /predict with body = FASTA or form/JSON (sequence=, title=, email=).
 Uses minimize_full_chain_hierarchical with cone funnel (stages 1–2) then Cartesian refinement (stage 3).
 If "email" param is set and SMTP is configured, also sends PDB by email.
 GET /health → 200 OK.
-Env: SMTP_* for email; SMTP_CC_TO to CC when not recipient; CASP_OUTPUT_DIR (default ./casp_results) for pending/ and outputs/; USE_FAST_PREDICT=1 to skip HKE; PREDICTION_TIMEOUT_SEC (default 3600) to stop after 1h and send current PDB; CASP_KNOWN_TARGETS_CACHE (optional) dir to cache known targets and experimental PDBs from predictioncenter.org for equal footing; CASP_ROUND (default CASP16).
+Env: SMTP_* for email; SMTP_CC_TO to CC when not recipient; CASP_OUTPUT_DIR (default ./casp_results) for pending/ and outputs/; USE_FAST_PREDICT=1 to skip HKE; PREDICTION_TIMEOUT_SEC (default 3600) to stop after 1h and send current PDB; CASP_MAX_CONCURRENT_JOBS (default 2) to cap parallel prediction subprocesses; CASP_KNOWN_TARGETS_CACHE (optional) dir to cache known targets and experimental PDBs from predictioncenter.org for equal footing; CASP_ROUND (default CASP16).
 Run from repo root: gunicorn -w 1 -b 127.0.0.1:8050 casp_server:app
 """
 
@@ -109,6 +109,9 @@ HKE_MAX_ITER = (
 )
 # Stop prediction after this many seconds; write current PDB, send email, then pick up next job.
 PREDICTION_TIMEOUT_SEC = int(os.environ.get("PREDICTION_TIMEOUT_SEC", "3600"))  # 1 hour
+# Max number of prediction jobs running at once (subprocesses). Prevents 70+ processes from starving each other.
+MAX_CONCURRENT_JOBS = max(1, int(os.environ.get("CASP_MAX_CONCURRENT_JOBS", "2")))
+_job_concurrency_semaphore = threading.Semaphore(MAX_CONCURRENT_JOBS)
 
 # Optional: cache dir for CASP known targets and experimental PDBs (predictioncenter.org). When set,
 # we match request sequences to known targets and fetch experimental refs so we're on equal footing.
@@ -904,7 +907,26 @@ def _run_one_job_with_timeout(
     Run one job (fast-pass if needed + HKE) in a subprocess with PREDICTION_TIMEOUT_SEC wall clock.
     After 1h we kill the process and send fast-pass so the user always gets a result.
     On failure: increment attempts, send failure email; if attempts >= MAX_ATTEMPTS move to .failed.txt.
+    Uses _job_concurrency_semaphore so at most MAX_CONCURRENT_JOBS run at once (startup + POST).
     """
+    with _job_concurrency_semaphore:
+        _run_one_job_with_timeout_impl(
+            job_id, base, sequences, seqs, to_email, job_title, ligand_str, txt_path, attempts
+        )
+
+
+def _run_one_job_with_timeout_impl(
+    job_id: str,
+    base: str,
+    sequences: list[str],
+    seqs: list[str],
+    to_email: str | None,
+    job_title: str | None,
+    ligand_str: str,
+    txt_path: str,
+    attempts: int,
+) -> None:
+    """Actual work for one job (called while holding _job_concurrency_semaphore)."""
     repo_root = os.path.dirname(os.path.abspath(__file__))
     payload = {
         "job_id": job_id,
@@ -1204,9 +1226,9 @@ def _run_full_job_pipelines(
 
 def process_pending_jobs() -> None:
     """
-    On startup: one thread per pending job. Each job runs in a subprocess with 1h wall-clock
-    timeout (fast-pass if needed, then HKE). After 1h we kill the process and send fast-pass
-    so the user always gets a result. No blocking join — no single job can block the rest.
+    On startup: one thread per pending job. At most MAX_CONCURRENT_JOBS run at once (semaphore).
+    Each job runs in a subprocess with 1h wall-clock timeout (fast-pass if needed, then HKE).
+    After 1h we kill the process and send fast-pass. No single job blocks the rest.
     """
     _ensure_output_dirs()
     if not os.path.isdir(PENDING_DIR):
@@ -1286,8 +1308,6 @@ def process_pending_jobs() -> None:
                     pass
     jobs = [j for j in jobs if j["attempts"] < MAX_ATTEMPTS]
 
-    # One thread per job: each job runs in a subprocess with 1h wall-clock timeout (fast-pass + HKE).
-    # After 1h we kill the process and send fast-pass so the user always gets a result.
     def _run_one_job(j: dict) -> None:
         if j["parsed_ligands"]:
             app.logger.info(
