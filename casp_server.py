@@ -112,6 +112,7 @@ PREDICTION_TIMEOUT_SEC = int(os.environ.get("PREDICTION_TIMEOUT_SEC", "3600"))  
 # Max number of prediction jobs running at once (subprocesses). Prevents 70+ processes from starving each other.
 MAX_CONCURRENT_JOBS = max(1, int(os.environ.get("CASP_MAX_CONCURRENT_JOBS", "2")))
 _job_concurrency_semaphore = threading.Semaphore(MAX_CONCURRENT_JOBS)
+DISABLE_PENDING_STARTUP = os.environ.get("CASP_DISABLE_PENDING_STARTUP", "").strip().lower() in ("1", "true", "yes")
 
 # Optional: cache dir for CASP known targets and experimental PDBs (predictioncenter.org). When set,
 # we match request sequences to known targets and fetch experimental refs so we're on equal footing.
@@ -339,20 +340,23 @@ def _backbone_sanity_check(backbone_atoms: list, job_context: str = "") -> None:
 
 def _pdb_sanity_check(pdb_content: str) -> tuple[bool, str]:
     """Return (True, '') if PDB coordinates are finite and in [-PDB_COORD_MAX, PDB_COORD_MAX]; else (False, reason)."""
-    # Match ATOM/HETATM lines and extract x,y,z (PDB cols 31-54, or any three numbers if format overflowed)
-    coord_fixed = re.compile(r"^(ATOM  |HETATM).{30}(.{8})(.{8})(.{8})")
+    # Extract x,y,z from standard PDB columns 31-54, or fall back to the last
+    # three numbers on overflowed/non-standard lines.
     num_pattern = re.compile(r"-?\d+\.?\d*")
     for line in pdb_content.splitlines():
         if not line.startswith("ATOM  ") and not line.startswith("HETATM"):
             continue
-        # Try fixed columns first
-        m = coord_fixed.match(line)
-        if m:
+        # Try standard fixed columns first (0-based slices 30:38, 38:46, 46:54).
+        if len(line) >= 54:
             try:
-                x, y, z = float(m.group(1).strip()), float(m.group(2).strip()), float(m.group(3).strip())
+                x = float(line[30:38].strip())
+                y = float(line[38:46].strip())
+                z = float(line[46:54].strip())
             except ValueError:
-                return False, "Non-numeric coordinates"
+                x = y = z = None
         else:
+            x = y = z = None
+        if x is None or y is None or z is None:
             # Overflowed format: take last three numbers on the line
             nums = num_pattern.findall(line)
             if len(nums) < 3:
@@ -660,6 +664,149 @@ def _update_pending_attempts(txt_path: str, attempts: int) -> None:
         f.writelines(lines)
 
 
+def _tail_text_file(path: str, max_chars: int = 2000) -> str:
+    """Read the tail of a text file for compact subprocess error reporting."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            data = f.read()
+    except Exception:
+        return ""
+    data = data.strip()
+    if len(data) > max_chars:
+        return "...\n" + data[-max_chars:]
+    return data
+
+
+def _subprocess_env() -> dict[str, str]:
+    """Disable startup queue scanning inside worker helper subprocesses."""
+    env = os.environ.copy()
+    env["CASP_DISABLE_PENDING_STARTUP"] = "1"
+    return env
+
+
+def _write_models_record(
+    base: str,
+    job_id: str,
+    job_title: str | None,
+    to_email: str | None,
+    models: list[dict],
+    *,
+    timed_out: bool = False,
+) -> None:
+    """Write outputs/{base}.models.json describing the delivered models."""
+    try:
+        record = {
+            "job_id": job_id,
+            "title": job_title,
+            "email": to_email,
+            "models": models,
+        }
+        if timed_out:
+            record["timed_out"] = True
+        models_path = os.path.join(OUTPUTS_DIR, f"{base}.models.json")
+        with open(models_path, "w") as f:
+            json.dump(record, f)
+    except Exception as e:
+        app.logger.warning("Failed to write models.json for job %s: %s", job_id, e)
+
+
+def _recover_completed_result(
+    base: str,
+    job_id: str,
+    job_title: str | None,
+    to_email: str | None,
+    seqs: list[str],
+    *,
+    timed_out: bool = False,
+    body_extra: str | None = None,
+) -> bool:
+    """
+    Recover a completed PDB left in pending/ or already written to outputs/.
+    This is used when a worker is interrupted after writing the main result but
+    before it can finish moving files and emailing the requester.
+    """
+    out_pdb_path = os.path.join(OUTPUTS_DIR, f"{base}.pdb")
+    pending_pdb_path = os.path.join(PENDING_DIR, f"{base}.pdb")
+    main_pdb_path = out_pdb_path if os.path.isfile(out_pdb_path) else pending_pdb_path
+    if not os.path.isfile(main_pdb_path):
+        return False
+
+    try:
+        with open(main_pdb_path) as f:
+            main_pdb = _prepend_pdb_model_line(f.read())
+    except Exception as e:
+        app.logger.warning("Could not read recovered PDB for job %s: %s", job_id, e)
+        return False
+
+    ok, reason = _pdb_sanity_check(main_pdb)
+    if not ok:
+        app.logger.warning("Recovered PDB for job %s failed sanity check: %s", job_id, reason)
+        return False
+
+    if main_pdb_path == pending_pdb_path:
+        _move_to_outputs(base, main_pdb)
+
+    fast_pdb = None
+    out_fast_path = os.path.join(OUTPUTS_DIR, f"{base}.fast.pdb")
+    pending_fast_path = os.path.join(PENDING_DIR, f"{base}.fast.pdb")
+    fast_pdb_path = out_fast_path if os.path.isfile(out_fast_path) else pending_fast_path
+    if os.path.isfile(fast_pdb_path):
+        try:
+            with open(fast_pdb_path) as f:
+                fast_pdb = _prepend_pdb_model_line(f.read())
+            if fast_pdb_path == pending_fast_path:
+                shutil.move(pending_fast_path, out_fast_path)
+        except Exception as e:
+            app.logger.warning("Could not recover fast-pass PDB for job %s: %s", job_id, e)
+            fast_pdb = None
+
+    ref_src = _experimental_ref_path_for_job(seqs, base)
+    if ref_src and os.path.isfile(ref_src):
+        ref_dst = os.path.join(OUTPUTS_DIR, f"{base}.experimental_ref.pdb")
+        if not os.path.isfile(ref_dst):
+            try:
+                shutil.copy2(ref_src, ref_dst)
+            except Exception as e:
+                app.logger.warning("Could not copy experimental ref during recovery: %s", e)
+
+    if fast_pdb:
+        _write_models_record(
+            base,
+            job_id,
+            job_title,
+            to_email,
+            models=[
+                {"name": "Prediction1.pdb", "stage": "hke", "type": "hke", "file": f"{base}.pdb"},
+                {"name": "Prediction2.pdb", "stage": "fast", "type": "fast", "file": f"{base}.fast.pdb"},
+            ],
+            timed_out=timed_out,
+        )
+        if to_email:
+            _send_pdb_email_multi(
+                to_email,
+                models=[
+                    ("Prediction1.pdb", main_pdb),
+                    ("Prediction2.pdb", fast_pdb),
+                ],
+                title=job_title,
+                body_extra=body_extra,
+            )
+    else:
+        _write_models_record(
+            base,
+            job_id,
+            job_title,
+            to_email,
+            models=[
+                {"name": "Prediction1.pdb", "stage": "hke", "type": "hke", "file": f"{base}.pdb"},
+            ],
+            timed_out=timed_out,
+        )
+        if to_email:
+            _send_pdb_email(to_email, main_pdb, job_title)
+    return True
+
+
 def _run_fast_pass(sequences: list[str], seqs: list[str]) -> str:
     """
     Fast-pass prediction: lightweight hierarchical run (compact folds).
@@ -808,32 +955,27 @@ def _run_hke_only(
         except Exception as e:
             app.logger.warning("Could not copy experimental ref: %s", e)
 
-    # Record models.json in outputs
-    models_path = os.path.join(OUTPUTS_DIR, f"{base}.models.json")
-    try:
-        record = {
-            "job_id": job_id,
-            "title": job_title,
-            "email": to_email,
-            "models": [
-                {
-                    "name": "Prediction1.pdb",
-                    "stage": "hke",
-                    "type": "hke",
-                    "file": f"{base}.pdb",
-                },
-                {
-                    "name": "Prediction2.pdb",
-                    "stage": "fast",
-                    "type": "fast",
-                    "file": f"{base}.fast.pdb",
-                },
-            ],
-        }
-        with open(models_path, "w") as f:
-            json.dump(record, f)
-    except Exception as e:
-        app.logger.warning("Failed to write models.json for job %s: %s", job_id, e)
+    _write_models_record(
+        base,
+        job_id,
+        job_title,
+        to_email,
+        models=[
+            {
+                "name": "Prediction1.pdb",
+                "stage": "hke",
+                "type": "hke",
+                "file": f"{base}.pdb",
+            },
+            {
+                "name": "Prediction2.pdb",
+                "stage": "fast",
+                "type": "fast",
+                "file": f"{base}.fast.pdb",
+            },
+        ],
+        timed_out=False,
+    )
 
     # 3) Second email: HKE as Prediction1.pdb, fast-pass as Prediction2.pdb (to requester and CC)
     if to_email:
@@ -941,6 +1083,8 @@ def _run_one_job_with_timeout_impl(
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         json.dump(payload, f)
         temp_path = f.name
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+        log_path = f.name
     run_cmd = [
         sys.executable,
         "-c",
@@ -952,21 +1096,19 @@ def _run_one_job_with_timeout_impl(
         temp_path,
     ]
     try:
-        proc = subprocess.Popen(
-            run_cmd,
-            cwd=repo_root,
-            start_new_session=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
+            proc = subprocess.Popen(
+                run_cmd,
+                cwd=repo_root,
+                env=_subprocess_env(),
+                start_new_session=True,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+            )
         try:
             proc.wait(timeout=PREDICTION_TIMEOUT_SEC)
             if proc.returncode != 0:
-                err_out = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
-                out_out = proc.stdout.read().decode("utf-8", errors="replace") if proc.stdout else ""
-                _run_one_job_subprocess_error = (err_out.strip() or out_out.strip() or "exit code %s" % proc.returncode)
-                if len(_run_one_job_subprocess_error) > 2000:
-                    _run_one_job_subprocess_error = "...\n" + _run_one_job_subprocess_error[-2000:]
+                _run_one_job_subprocess_error = _tail_text_file(log_path) or "exit code %s" % proc.returncode
                 raise subprocess.CalledProcessError(proc.returncode, run_cmd)
         except subprocess.TimeoutExpired:
             if hasattr(os, "killpg"):
@@ -990,6 +1132,21 @@ def _run_one_job_with_timeout_impl(
                 job_id,
                 PREDICTION_TIMEOUT_SEC,
             )
+            timeout_note = (
+                f"This prediction was stopped after the {PREDICTION_TIMEOUT_SEC // 3600}-hour time limit. "
+                "A completed model was recovered from the worker state and attached."
+            )
+            if _recover_completed_result(
+                base,
+                job_id,
+                job_title,
+                to_email,
+                seqs,
+                timed_out=True,
+                body_extra=timeout_note,
+            ):
+                app.logger.info("Recovered completed PDB for timed-out job %s.", job_id)
+                return
             fast_path = os.path.join(PENDING_DIR, f"{base}.fast.pdb")
             if not os.path.isfile(fast_path):
                 _update_pending_attempts(txt_path, attempts + 1)
@@ -1027,19 +1184,17 @@ def _run_one_job_with_timeout_impl(
             except Exception:
                 pass
             try:
-                models_path = os.path.join(OUTPUTS_DIR, f"{base}.models.json")
-                record = {
-                    "job_id": job_id,
-                    "title": job_title,
-                    "email": to_email,
-                    "timed_out": True,
-                    "models": [
+                _write_models_record(
+                    base,
+                    job_id,
+                    job_title,
+                    to_email,
+                    models=[
                         {"name": "Prediction1.pdb", "stage": "fast", "type": "fast", "file": f"{base}.pdb"},
                         {"name": "Prediction2.pdb", "stage": "fast", "type": "fast", "file": f"{base}.fast.pdb"},
                     ],
-                }
-                with open(models_path, "w") as f:
-                    json.dump(record, f)
+                    timed_out=True,
+                )
             except Exception as e:
                 app.logger.warning("Failed to write models.json after timeout: %s", e)
             body_extra = (
@@ -1057,6 +1212,9 @@ def _run_one_job_with_timeout_impl(
                     body_extra=body_extra,
                 )
     except subprocess.CalledProcessError as e:
+        if _recover_completed_result(base, job_id, job_title, to_email, seqs):
+            app.logger.info("Recovered completed PDB for failed job %s after subprocess exit.", job_id)
+            return
         new_attempts = attempts + 1
         _update_pending_attempts(txt_path, new_attempts)
         err_msg = _run_one_job_subprocess_error.strip() if _run_one_job_subprocess_error else "HKE subprocess exited with error (code %s)." % getattr(e, "returncode", "?")
@@ -1068,6 +1226,9 @@ def _run_one_job_with_timeout_impl(
             except Exception:
                 pass
     except Exception as e:
+        if _recover_completed_result(base, job_id, job_title, to_email, seqs):
+            app.logger.info("Recovered completed PDB for job %s after exception.", job_id)
+            return
         app.logger.warning("Pending job %s failed: %s", job_id, e)
         new_attempts = attempts + 1
         _update_pending_attempts(txt_path, new_attempts)
@@ -1081,6 +1242,10 @@ def _run_one_job_with_timeout_impl(
     finally:
         try:
             os.unlink(temp_path)
+        except Exception:
+            pass
+        try:
+            os.unlink(log_path)
         except Exception:
             pass
 
@@ -1135,6 +1300,7 @@ def _run_hke_only_with_timeout(
         proc = subprocess.Popen(
             run_cmd,
             cwd=repo_root,
+            env=_subprocess_env(),
             start_new_session=True,
         )
         try:
@@ -1286,6 +1452,9 @@ def process_pending_jobs() -> None:
         job_title = req.get("title")
         ligand_str = (req.get(LIGAND_KEY) or "").strip()
         parsed_ligands = parse_ligands(ligand_str) if ligand_str else []
+        if _recover_completed_result(base, job_id, job_title, to_email, seqs):
+            app.logger.info("Recovered completed pending job %s on startup.", job_id)
+            continue
         jobs.append({
             "job_id": job_id,
             "base": base,
@@ -1716,8 +1885,9 @@ def health():
 
 def _status_request_info(job_id: str) -> dict | None:
     """Load request.json for job_id from pending or outputs; return request array without email."""
-    for base in (PENDING_DIR, OUTPUTS_DIR):
-        path = os.path.join(base, f"{job_id}.request.json")
+    for directory in (PENDING_DIR, OUTPUTS_DIR):
+        base = _find_base_for_job_id(job_id, directory) or job_id
+        path = os.path.join(directory, f"{base}.request.json")
         if not os.path.isfile(path):
             continue
         try:
@@ -1963,7 +2133,8 @@ def _start_pending_processor() -> None:
     t.start()
 
 
-_start_pending_processor()
+if not DISABLE_PENDING_STARTUP:
+    _start_pending_processor()
 
 
 if __name__ == "__main__":
