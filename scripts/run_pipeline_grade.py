@@ -28,15 +28,18 @@ import time
 from typing import Any, Dict, List, Optional
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO not in sys.path:
-    sys.path.insert(0, _REPO)
+_SRC = os.path.join(_REPO, "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
 
 from horizon_physics.proteins.full_protein_minimizer import full_chain_to_pdb, minimize_full_chain
 from horizon_physics.proteins.grade_folds import ca_rmsd, load_ca_and_sequence_from_pdb
 from horizon_physics.proteins.hqiv_lean_folding import PHYSIOLOGICAL_PH
 from horizon_physics.proteins.lean_ribosome_tunnel_pipeline import fold_lean_ribosome_tunnel
 
-CRAMBIN_GOLD = os.path.join(_REPO, "horizon_physics/proteins/examples/crambin_1CRN.pdb")
+CRAMBIN_GOLD = os.path.join(
+    _REPO, "src", "horizon_physics", "proteins", "examples", "crambin_1CRN.pdb"
+)
 CRAMBIN_SEQ = "TTCCPSIVARSNFNVCRLPGTPEAIICGDVCDLDCTAKTCFSIICT"
 
 

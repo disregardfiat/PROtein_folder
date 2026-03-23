@@ -1,0 +1,4 @@
+# file: /home/jr/Repos/PROtien/src/horizon_physics/proteins/hierarchical/backend.py
+# hypothesis_version: 6.151.9
+
+['__array__', 'cpu', 'cuda', 'gpu', 'jax', 'numpy', 'tpu']

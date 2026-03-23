@@ -1,0 +1,71 @@
+site_name: PROtein — HQIV folding
+site_description: First-principles protein structure from Horizon-centric Quantum Information and Vacuum (HQIV) — no ML, no empirical force fields.
+site_url: https://disregardfiat.github.io/protein_folder/
+repo_url: https://github.com/disregardfiat/protein_folder
+repo_name: disregardfiat/protein_folder
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: teal
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: teal
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - content.code.copy
+    - search.suggest
+    - search.highlight
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            docstring_style: google
+            show_source: true
+            show_root_heading: true
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.arithmatex:
+      generic: true
+  - toc:
+      permalink: true
+
+extra_javascript:
+  - javascript/mathjax.js
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
+
+nav:
+  - Home: index.md
+  - Theory & HQIV: theory.md
+  - Installation: installation.md
+  - How it works: how-it-works.md
+  - API reference: api.md
+  - Examples & gallery: examples.md
+  - Benchmarks & validation: benchmarks.md
+  - Live demo: live-demo.md
+  - Deep dives:
+      - EM field pipeline: em_field_pipeline.md
+      - Tunnel & temperature: tunnel_temperature_folding.md
+      - Roadmap: ROADMAP.md
+  - Contributing: contributing.md
+  - Government use & license: government-use.md

@@ -1,0 +1,4 @@
+# file: /home/jr/Repos/PROtien/src/horizon_physics/proteins/grading/__init__.py
+# hypothesis_version: 6.151.9
+
+['grade_prediction', 'grade_trajectory']

@@ -1,0 +1,4 @@
+# file: /home/jr/Repos/PROtien/src/horizon_physics/proteins/grading/metrics.py
+# hypothesis_version: 6.151.9
+
+['ca_rmsd_ang', 'n_res', 'per_residue_rmsd_max', 'per_residue_rmsd_min']

@@ -1,0 +1,4 @@
+# file: /home/jr/Repos/PROtien/src/horizon_physics/proteins/side_chain_placement.py
+# hypothesis_version: 6.151.9
+
+[-60.0, 60.0, 180.0, 'ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLN', 'GLU', 'GLY', 'HIS', 'ILE', 'LEU', 'LYS', 'MET', 'PHE', 'PRO', 'SER', 'THR', 'TRP', 'TYR', 'VAL', '__main__', 'chi', 'chi1_deg', 'chi2_deg', 'chi3_deg', 'chi4_deg', 'g+', 'ring', 'rotamer', 't', '—']

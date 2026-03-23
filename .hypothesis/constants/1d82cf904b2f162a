@@ -1,0 +1,4 @@
+# file: /home/jr/Repos/PROtien/src/horizon_physics/proteins/hierarchical/_energy_jax.py
+# hypothesis_version: 6.151.9
+
+[0.0, 1e-12, 1e-09, 0.1, 0.5, 0.91, 1.0, 1.53, 2.0, 2.5, 3.8, 6.0, 15.0, 200.0, 500.0, 1973.269804]

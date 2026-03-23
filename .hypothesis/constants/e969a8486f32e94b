@@ -1,0 +1,4 @@
+# file: /home/jr/Repos/PROtien/src/horizon_physics/proteins/lean_ribosome_tunnel_pipeline.py
+# hypothesis_version: 6.151.9
+
+[0.0, 0.01, 0.2, 0.25, 0.5, 12.0, 25.0, 310.0, 200, 'em_treetorque', 'ligand_refine_steps', 'ligand_step_ang', 'ligand_step_t']

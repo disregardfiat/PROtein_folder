@@ -1,0 +1,4 @@
+# file: /home/jr/Repos/PROtien/src/horizon_physics/proteins/post_tunnel_em_treetorque.py
+# hypothesis_version: 6.151.9
+
+[0.02, 0.022, 0.028, 0.03, 0.2, 0.5, 1.0, 3.0, 5.0, 7.0, 18.0, 22.0, 34.0, 273.15, 310.0, 328.0, 345.0, 360.0, 365.0, 140, 200, 520, 'CA', 'E_ca_final', 'anneal_schedule_k', 'anneal_stages', 'em_max_steps_cap', 'em_relax_steps', 'empty sequence', 'message', 'n_accept', 'phases', 'phases_ran', 'temperature_k', 'treetorque_accept', 'treetorque_error', 'treetorque_ok']

@@ -18,8 +18,9 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO not in sys.path:
-    sys.path.insert(0, _REPO)
+_SRC = os.path.join(_REPO, "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
 
 from horizon_physics.proteins.casp_targets import CASPTarget, fetch_known_targets, ensure_experimental_ref
 from horizon_physics.proteins.full_protein_minimizer import minimize_full_chain, full_chain_to_pdb

@@ -1,0 +1,4 @@
+# file: /home/jr/Repos/PROtien/src/horizon_physics/proteins/temperature_path_search.py
+# hypothesis_version: 6.151.9
+
+[-60.0, 0.0, 1e-25, 1e-06, 8.617333e-05, 0.2, 0.5, 1.0, 2.0, 5.0, 15.0, 60.0, 310.0, 200, 500, 'UNK', 'accept', 'all_locked', 'converged', 'discrete_seed', 'lock_every', 'phase', 'phases', 'steps', 'temperature', 'use_metropolis']

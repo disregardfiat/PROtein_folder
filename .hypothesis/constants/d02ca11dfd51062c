@@ -1,0 +1,4 @@
+# file: /home/jr/Repos/PROtien/src/horizon_physics/proteins/hierarchical/energy.py
+# hypothesis_version: 6.151.9
+
+['energy_total', 'grad_positions']

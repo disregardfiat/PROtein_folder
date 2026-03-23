@@ -1,0 +1,4 @@
+# file: /home/jr/Repos/PROtien/src/horizon_physics/proteins/peptide_backbone.py
+# hypothesis_version: 6.151.9
+
+[0.1, 1.0, 1.23, 1.28, 1.38, 1.5, 1.56, 2.2, 2.5, 180.0, -180, -120, 120, 180, 'C', 'C_N', 'C_O', 'Calpha_C', 'Calpha_Cbeta', 'N', 'N_Calpha', 'O', '__main__', 'energy', 'ij', 'omega_deg', 'phi_alpha_deg', 'phi_beta_deg', 'phi_deg', 'psi_alpha_deg', 'psi_beta_deg', 'psi_deg']

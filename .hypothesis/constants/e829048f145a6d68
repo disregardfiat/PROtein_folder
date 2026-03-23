@@ -1,0 +1,4 @@
+# file: /home/jr/Repos/PROtien/src/horizon_physics/proteins/hierarchical/minimize_hierarchical.py
+# hypothesis_version: 6.151.9
+
+[0.0, 1e-06, 1e-05, 0.005, 0.01, 0.02, 0.2, 0.5, 1.0, 2.0, 5.0, 8.0, 100.0, 100, 120, 'C', 'CA', 'CB', 'C_O', 'Calpha_C', 'G', 'L-BFGS-B', 'N', 'N_Calpha', 'O', 'backbone_atoms', 'e_final', 'funnel_radius', 'funnel_radius_exit', 'funnel_stiffness', 'gtol', 'include_bonds', 'include_clash', 'include_horizon', 'include_sidechains', 'maxiter', 'n_res', 'ndim', 'positions', 'residue', 'sequence', 'stage1_iter', 'stage2_iter', 'stage3_iter', 'success', 't', 'w']

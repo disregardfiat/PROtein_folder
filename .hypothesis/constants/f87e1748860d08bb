@@ -1,0 +1,4 @@
+# file: /home/jr/Repos/PROtien/src/horizon_physics/proteins/alpha_helix.py
+# hypothesis_version: 6.151.9
+
+[0.01, 1.0, 1.5, 2.3, 2.9, 5.4, 360.0, 'N', 'O', '__main__', 'hbond_N_O_ang', 'helix_radius_ang', 'pitch_ang', 'residues_per_turn', 'rise_ang', 'rise_per_residue_ang', 'turn_angle_deg']

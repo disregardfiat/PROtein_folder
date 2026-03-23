@@ -1,75 +1,60 @@
-# PROtein — HQIV Protein Folding
+# PROtein — HQIV protein folding
 
-Physically Rotating by Order: First-principles protein structure prediction from the **Horizon-centric Quantum Information and Vacuum (HQIV)** framework. No empirical force fields, no PDB statistics.
-HQIV => https://zenodo.org/records/18794890
+First-principles protein structure from **Horizon-centric Quantum Information and Vacuum (HQIV)**. **No ML**, **no PDB statistics**, **no empirical force fields**. Formal definitions and proofs live in **[hqiv-lean](https://github.com/disregardfiat/hqiv-lean)**.
 
-## Quick start
+**License:** MIT **with an explicit government-use restriction** — see [`LICENSE`](LICENSE) and [`GOVERNMENT_USE.md`](GOVERNMENT_USE.md). PyPI metadata includes the same notice.
+
+## Documentation
+
+**[https://disregardfiat.github.io/protein_folder/](https://disregardfiat.github.io/protein_folder/)** — theory (with Lean links), installation, API (mkdocstrings), benchmarks, contributing, live demo.
+
+Build locally: `pip install -e ".[dev]"` then `mkdocs serve`.
+
+## Install
 
 ```bash
-pip install numpy  # Python 3.10+
-python -c "
+pip install "protein-folder[full]"
+```
+
+Extras: `tpu` (JAX), `grading` (pandas), `demo` (Streamlit + Flask stack). Editable clone:
+
+```bash
+git clone https://github.com/disregardfiat/protein_folder.git && cd protein_folder
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+```
+
+Docker: `docker build -t protein-folder:cpu .` — see [`Dockerfile`](Dockerfile) and [`Dockerfile.tpu`](Dockerfile.tpu).
+
+## Quick API
+
+```python
 from horizon_physics.proteins import minimize_full_chain, full_chain_to_pdb
-result = minimize_full_chain('MKFLNDR', include_sidechains=True)
+
+result = minimize_full_chain("MKFLNDR", include_sidechains=True)
 print(full_chain_to_pdb(result))
-"
 ```
 
-### Optional: JAX and TPU
+Package layout: **`src/horizon_physics/`** (import name unchanged). Tests: **`tests/`**. CASP-style server: **`casp_server.py`** at repo root.
 
-For the hierarchical minimizer and TPU/GPU acceleration:
+## Live demo
 
 ```bash
-python -m venv .venv && source .venv/bin/activate  # or .venv\Scripts\activate on Windows
-pip install -r requirements.txt
-pip install -r requirements-tpu.txt   # jax, jaxlib
+pip install "protein-folder[demo]"
+protein-folder-streamlit
 ```
 
-On a **Google Cloud TPU VM**, install TPU support so JAX sees the device:
+## Citation
 
-```bash
-pip install "jax[tpu]"
-# or if libtpu download fails: pip install libtpu -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-```
+HQIV framework (academic request in LICENSE): [Zenodo](https://doi.org/10.5281/zenodo.18794889).
 
-### Co-translational ribosome tunnel (optional)
+## Repository layout (high level)
 
-Simulate the ribosome exit tunnel: null search cone, plane at the lip, **binary-tree** segment schedule (to damp vibrations), fast-pass spaghetti (rigid group + bell-end), and a short HKE min pass per segment. With `post_extrusion_refine=True` (default), the full HKE collapse/refine is run repeatedly after extrusion until no Cα moves more than 0.5 Å per 100 residues (adaptive).
+| Path | Role |
+|------|------|
+| `src/horizon_physics/proteins/` | Folding pipeline, energy, tunnel, CASP hooks |
+| `tests/` | Pytest + Hypothesis |
+| `docs/` | MkDocs site sources |
+| `scripts/` | CASP grading / benchmark drivers |
 
-```bash
-python -c "
-from horizon_physics.proteins import minimize_full_chain, full_chain_to_pdb
-result = minimize_full_chain(
-    'MKFLNDR',
-    simulate_ribosome_tunnel=True,
-    tunnel_length=25.0,
-    cone_half_angle_deg=12.0,
-)
-print(full_chain_to_pdb(result))
-"
-```
-
-### Live trajectory visualizer
-
-When running the minimizer (or tunnel pipeline) with a trajectory log, you can watch Cα positions update in real time in a separate process:
-
-```bash
-# Terminal 1: run tunnel with trajectory log (writes JSONL)
-python -m horizon_physics.proteins.examples.run_tunnel_and_grade --targets T1037 --trajectory-log /tmp/t1037_traj.jsonl
-
-# Terminal 2: live 3D view (tails the log; requires matplotlib)
-python -m horizon_physics.proteins.examples.live_trajectory_viz /tmp/t1037_traj.jsonl
-```
-
-The visualizer runs in a separate process and tails the JSONL file, so it does not affect minimizer performance.
-
-## Package
-
-- **`horizon_physics/proteins/`** — Full HQIV protein folding pipeline
-- See [horizon_physics/proteins/README.md](horizon_physics/proteins/README.md) for details
-
-## License
-
-**License note (March 2026)**  
-This project is released under the MIT License **with an explicit Government Use Restriction**.  
-Governments worldwide may **not** use, fork, or run this software without first purchasing a paid seat from me (disregardfiat). Seat availability and pricing are at my sole discretion.  
-Individuals, companies, universities, and non-profits continue to enjoy full MIT rights.
+Details: [documentation site](https://disregardfiat.github.io/protein_folder/) and [`src/horizon_physics/proteins/README.md`](src/horizon_physics/proteins/README.md).

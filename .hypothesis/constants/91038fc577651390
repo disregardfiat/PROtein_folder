@@ -1,0 +1,4 @@
+# file: /home/jr/Repos/PROtien/src/horizon_physics/proteins/em_field_pipeline.py
+# hypothesis_version: 6.151.9
+
+[-80.0, -40.0, -0.5, -0.3, 0.0, 1e-12, 1e-09, 1e-08, 0.01, 0.02, 0.08, 0.1, 0.12, 0.15, 0.2, 0.25, 0.35, 0.5, 0.8, 0.98, 1.0, 1.15, 1.2, 1.5, 2.0, 2.5, 3.0, 3.8, 4.0, 5.0, 6.0, 8.0, 8.5, 10.0, 12.0, 20.0, 25.0, 200.0, 310.0, 1000000000000.0, 300, 800, 2000, '>', 'A', 'C', 'CA', 'C_N', 'C_O', 'Calpha_C', 'END', 'ENDMDL', 'H', 'MODEL     1', 'N', 'N_Calpha', 'O', 'UNK', 'charge', 'ij', 'name', 'offset']

@@ -1,0 +1,4 @@
+# file: /home/jr/Repos/PROtien/src/horizon_physics/proteins/beta_sheet.py
+# hypothesis_version: 6.151.9
+
+[0.0, 1.0, 2.9, 3.2, 4.0, 4.7, 5.5, 6.4, 'N', 'O', '__main__', 'hbond_N_O_ang', 'phi_beta_deg', 'pleat_repeat_ang', 'psi_beta_deg', 'rise_per_residue_ang', 'strand_offset_ang', 'strand_spacing_ang']

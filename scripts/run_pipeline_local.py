@@ -13,7 +13,7 @@ import tempfile
 
 # Repo root
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, repo_root)
+sys.path.insert(0, os.path.join(repo_root, "src"))
 
 # Use a temp output dir so we don't touch real pending/outputs
 out_base = os.environ.get("CASP_OUTPUT_DIR")

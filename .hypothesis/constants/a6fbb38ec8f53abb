@@ -1,0 +1,4 @@
+# file: /home/jr/Repos/PROtien/src/horizon_physics/proteins/grading/trajectory_grade.py
+# hypothesis_version: 6.151.9
+
+['6dof', 'cartesian', 'csv', 'format', 'frame', 'json', 'pd.DataFrame', 'per_residue_rmsd_max', 'per_residue_rmsd_min', 'positions', 'rmsd_ang', 't', 'w']

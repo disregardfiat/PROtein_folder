@@ -1,0 +1,4 @@
+# file: /home/jr/Repos/PROtien/src/horizon_physics/proteins/assembly_energy.py
+# hypothesis_version: 6.151.9
+
+[0.0, 'atomic_sum', 'bond_sequential', 'bond_tree_recursive', 'branch_eq_linear_ok', 'clash', 'total_ca_with_bonds']

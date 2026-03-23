@@ -1,0 +1,4 @@
+# file: /home/jr/Repos/PROtien/src/horizon_physics/proteins/grade_folds.py
+# hypothesis_version: 6.151.9
+
+['--no-resid', 'A', 'ALA', 'ARG', 'ASN', 'ASP', 'ATOM ', 'C', 'CA', 'CYS', 'Cα-RMSD: {:.3f} Å', 'D', 'E', 'Error:', 'F', 'G', 'GLN', 'GLU', 'GLY', 'H', 'HETATM', 'HIS', 'I', 'ILE', 'K', 'L', 'LEU', 'LYS', 'M', 'MET', 'N', 'P', 'PHE', 'PRO', 'Q', 'R', 'S', 'SER', 'T', 'THR', 'TRP', 'TYR', 'V', 'VAL', 'W', 'X', 'Y', '__main__']

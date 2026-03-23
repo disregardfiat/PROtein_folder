@@ -21,8 +21,9 @@ import time
 import numpy as np
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO not in sys.path:
-    sys.path.insert(0, _REPO)
+_SRC = os.path.join(_REPO, "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
 
 from horizon_physics.proteins.folding_energy import rg_squared  # noqa: E402
 from horizon_physics.proteins.grade_folds import ca_rmsd  # noqa: E402

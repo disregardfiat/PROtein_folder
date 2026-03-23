@@ -1,0 +1,4 @@
+# file: /home/jr/Repos/PROtien/src/horizon_physics/proteins/hierarchical/protein.py
+# hypothesis_version: 6.151.9
+
+[-1.0, 0.0, 1e-20, 1e-12, 1e-09, 1e-05, 0.3, 1.0, 2.0, 3.0, 3.141592653589793, 4.0, 5.0, 8.0, 180.0, 100, 120, 'C', 'CA', 'C_N', 'C_O', 'Calpha_C', 'E', 'N', 'N_Calpha', 'O', 'Protein', 'compute_total_energy', 'domain', 'forward_kinematics', 'get_dofs', 'helix_unit', 'math', 'residue', 'root', 'set_dofs', 'ss']

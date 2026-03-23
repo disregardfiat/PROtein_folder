@@ -1,0 +1,182 @@
+[
+  {
+    "round": 1,
+    "rows": [
+      {
+        "target_id": "T1235",
+        "config": "baseline_quick_tunnel",
+        "seconds": 77.10807387001114,
+        "ca_rmsd_ang": 149.8119432953528,
+        "n_graded": 114,
+        "error": null,
+        "kwargs": {
+          "quick": true,
+          "simulate_ribosome_tunnel": true,
+          "include_sidechains": false,
+          "fast_local_theta": true,
+          "horizon_neighbor_cutoff": null,
+          "kappa_dihedral": 0.01,
+          "hbond_weight": 0.0,
+          "fast_pass_steps_per_connection": 2,
+          "min_pass_iter_per_connection": 5,
+          "post_extrusion_refine": true,
+          "post_extrusion_max_rounds": 12
+        }
+      },
+      {
+        "target_id": "T1235",
+        "config": "quick_notunnel",
+        "seconds": 1956.1308843730076,
+        "ca_rmsd_ang": 57.17145717505209,
+        "n_graded": 114,
+        "error": null,
+        "kwargs": {
+          "quick": true,
+          "simulate_ribosome_tunnel": false,
+          "include_sidechains": false,
+          "fast_local_theta": true,
+          "horizon_neighbor_cutoff": 10.0,
+          "kappa_dihedral": 0.01,
+          "hbond_weight": 0.0
+        }
+      },
+      {
+        "target_id": "T1235",
+        "config": "refine_tunnel",
+        "seconds": 71.57154563198856,
+        "ca_rmsd_ang": 142.93147844135024,
+        "n_graded": 114,
+        "error": null,
+        "kwargs": {
+          "quick": false,
+          "simulate_ribosome_tunnel": true,
+          "include_sidechains": false,
+          "fast_local_theta": true,
+          "horizon_neighbor_cutoff": null,
+          "kappa_dihedral": 0.01,
+          "hbond_weight": 0.0,
+          "fast_pass_steps_per_connection": 5,
+          "min_pass_iter_per_connection": 15,
+          "post_extrusion_refine": true,
+          "post_extrusion_refine_mode": "em_treetorque",
+          "post_extrusion_treetorque_phases": 8,
+          "post_extrusion_treetorque_n_steps": 200
+        }
+      },
+      {
+        "target_id": "T1235",
+        "config": "refine_tunnel_kink",
+        "seconds": 0.00681674100633245,
+        "ca_rmsd_ang": null,
+        "n_graded": null,
+        "error": "No module named 'horizon_physics.proteins.collective_modes_scalars'",
+        "kwargs": {
+          "quick": false,
+          "simulate_ribosome_tunnel": true,
+          "include_sidechains": false,
+          "fast_local_theta": true,
+          "horizon_neighbor_cutoff": 10.0,
+          "kappa_dihedral": 0.01,
+          "hbond_weight": 0.0,
+          "collective_kink_weight": 0.005,
+          "collective_kink_m": 3,
+          "collective_kink_use_ss_mask": true,
+          "fast_pass_steps_per_connection": 5,
+          "min_pass_iter_per_connection": 15,
+          "post_extrusion_refine": true,
+          "post_extrusion_refine_mode": "em_treetorque",
+          "post_extrusion_treetorque_phases": 8,
+          "post_extrusion_treetorque_n_steps": 200
+        }
+      }
+    ],
+    "aggregate": [
+      {
+        "config": "quick_notunnel",
+        "n": 1,
+        "n_ok": 1,
+        "mean_rmsd": 57.17145717505209,
+        "mean_seconds": 1956.1308843730076,
+        "kwargs": {
+          "quick": true,
+          "simulate_ribosome_tunnel": false,
+          "include_sidechains": false,
+          "fast_local_theta": true,
+          "horizon_neighbor_cutoff": 10.0,
+          "kappa_dihedral": 0.01,
+          "hbond_weight": 0.0
+        }
+      },
+      {
+        "config": "refine_tunnel",
+        "n": 1,
+        "n_ok": 1,
+        "mean_rmsd": 142.93147844135024,
+        "mean_seconds": 71.57154563198856,
+        "kwargs": {
+          "quick": false,
+          "simulate_ribosome_tunnel": true,
+          "include_sidechains": false,
+          "fast_local_theta": true,
+          "horizon_neighbor_cutoff": null,
+          "kappa_dihedral": 0.01,
+          "hbond_weight": 0.0,
+          "fast_pass_steps_per_connection": 5,
+          "min_pass_iter_per_connection": 15,
+          "post_extrusion_refine": true,
+          "post_extrusion_refine_mode": "em_treetorque",
+          "post_extrusion_treetorque_phases": 8,
+          "post_extrusion_treetorque_n_steps": 200
+        }
+      },
+      {
+        "config": "baseline_quick_tunnel",
+        "n": 1,
+        "n_ok": 1,
+        "mean_rmsd": 149.8119432953528,
+        "mean_seconds": 77.10807387001114,
+        "kwargs": {
+          "quick": true,
+          "simulate_ribosome_tunnel": true,
+          "include_sidechains": false,
+          "fast_local_theta": true,
+          "horizon_neighbor_cutoff": null,
+          "kappa_dihedral": 0.01,
+          "hbond_weight": 0.0,
+          "fast_pass_steps_per_connection": 2,
+          "min_pass_iter_per_connection": 5,
+          "post_extrusion_refine": true,
+          "post_extrusion_max_rounds": 12
+        }
+      },
+      {
+        "config": "refine_tunnel_kink",
+        "n": 1,
+        "n_ok": 0,
+        "mean_rmsd": 1000000000.0,
+        "mean_seconds": 0.00681674100633245,
+        "kwargs": {
+          "quick": false,
+          "simulate_ribosome_tunnel": true,
+          "include_sidechains": false,
+          "fast_local_theta": true,
+          "horizon_neighbor_cutoff": 10.0,
+          "kappa_dihedral": 0.01,
+          "hbond_weight": 0.0,
+          "collective_kink_weight": 0.005,
+          "collective_kink_m": 3,
+          "collective_kink_use_ss_mask": true,
+          "fast_pass_steps_per_connection": 5,
+          "min_pass_iter_per_connection": 15,
+          "post_extrusion_refine": true,
+          "post_extrusion_refine_mode": "em_treetorque",
+          "post_extrusion_treetorque_phases": 8,
+          "post_extrusion_treetorque_n_steps": 200
+        }
+      }
+    ],
+    "targets": [
+      "T1235"
+    ]
+  }
+]

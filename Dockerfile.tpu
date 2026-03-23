@@ -1,0 +1,24 @@
+# JAX / TPU-oriented image (Google Cloud TPU VM or compatible environment)
+#
+# Cloud TPU VMs ship JAX + libtpu; this Dockerfile documents a reproducible CPU/GPU
+# wheel install. On an actual TPU VM, prefer the vendor image and then:
+#   pip install "protein-folder[tpu,full]"
+#
+# Build (CPU JAX smoke):  docker build -f Dockerfile.tpu -t protein-folder:tpu .
+# On TPU VM (host libtpu): pip install "jax[tpu]" per https://jax.readthedocs.io/
+
+FROM python:3.11-slim-bookworm
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    JAX_ENABLE_X64=1
+
+WORKDIR /app
+
+COPY pyproject.toml README.md LICENSE GOVERNMENT_USE.md ./
+COPY src ./src
+
+RUN pip install --upgrade pip && \
+    pip install ".[full,tpu]"
+
+CMD ["python", "-c", "import jax; print('JAX', jax.__version__, 'devices', jax.devices())"]

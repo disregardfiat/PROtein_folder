@@ -1,0 +1,4 @@
+# file: /home/jr/Repos/PROtien/src/horizon_physics/proteins/folding_energy.py
+# hypothesis_version: 6.151.9
+
+[0.0, 1e-12, 1e-09, 1e-05, 2e-05, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 2.5, 3.0, 3.8, 6.0, 7.6, 12.0, 15.0, 200.0, 500.0, 1e+30, 100, 200, 'AAA', '__main__', 'collective_kink_m', 'e_final', 'e_initial', 'e_tot', 'em_scale', 'hbond_dist_cutoff', 'hbond_max_pairs', 'hbond_min_seq_sep', 'hbond_shell_m', 'hbond_weight', 'include_clash', 'k_bond', 'k_clash', 'k_horizon', 'neighbor_cutoff', 'per_residue', 'r_clash', 'r_eq', 'r_horizon', 'r_max', 'r_min', 'r_ref', 'use_neighbor_list']

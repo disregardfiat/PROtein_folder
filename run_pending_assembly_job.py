@@ -13,7 +13,8 @@ import sys
 import zipfile
 
 # Repo root
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_root = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_root, "src"))
 
 # Same sequences as pending job 1772419986_4500 (CAMEO 6aaf9bfc19)
 SEQ_A = "VHLTGEEKSGLTALWAKVNVEEIGGEALGRLLVVYPWTQRFFEHFGDLSTADAVMKNPKVKKHGQKVLASFGEGLKHLDNLKGTFATLSELHCDKLHVDPENFRLLGNVLVVVLARHFGKEFTPELQTAYQKVVAGVANALAHKYH"

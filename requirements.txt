@@ -1,7 +1,9 @@
-# PROtein — base (Python 3.10+)
+# PROtein — legacy flat requirements. Prefer packaging install:
+#   pip install "protein-folder[full]"
+# or from a clone:
+#   pip install -e ".[full]"
+#
+# Python 3.10+
 numpy>=1.22
 scipy>=1.9
-
-# Optional but recommended: pyhqiv — metric math (φ, γ, Θ) and tree-torque discrete φ/ψ (pyhqiv.molecular)
-# Required for extrusion + 3-cycle pipeline (run_discrete_refinement). Install with: pip install pyhqiv
 pyhqiv

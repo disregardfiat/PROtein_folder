@@ -1,0 +1,4 @@
+# file: /home/jr/Repos/PROtien/src/horizon_physics/proteins/discrete_dof.py
+# hypothesis_version: 6.151.9
+
+[0.0, 5.0, 'DiscreteDof', 'phi', 'psi']

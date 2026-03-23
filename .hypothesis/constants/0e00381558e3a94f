@@ -1,0 +1,4 @@
+# file: /home/jr/Repos/PROtien/src/horizon_physics/proteins/tunnel_temperature_pipeline.py
+# hypothesis_version: 6.151.9
+
+[310.0, 'cart.pdb', 'tunnel.pdb', 'w']

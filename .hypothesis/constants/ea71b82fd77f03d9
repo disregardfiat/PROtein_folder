@@ -1,0 +1,4 @@
+# file: /home/jr/Repos/PROtien/src/horizon_physics/proteins/co_translational_tunnel.py
+# hypothesis_version: 6.151.9
+
+[-1.0, -1e-09, 0.0, 1e-30, 1e-12, 1e-09, 1e-08, 1e-06, 1e-05, 8.617333262e-05, 0.0001, 0.025, 0.2, 0.3, 0.5, 1.0, 2.5, 6.0, 310.0, 'e_final', 'e_initial', 'message', 'n_iter', 'n_steps', 'noise_rms', 'segments', 'steps', 'success', 'temperature_k']

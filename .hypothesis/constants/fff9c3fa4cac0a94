@@ -1,0 +1,4 @@
+# file: /home/jr/Repos/PROtien/src/horizon_physics/proteins/ligands.py
+# hypothesis_version: 6.151.9
+
+[2000, '#', ', ', '0 ligands', 'ATOM  ', 'B', 'BR', 'C', 'CA', 'CL', 'F', 'FE', 'H', 'HE', 'HETATM', 'I', 'InChI=', 'K', 'LI', 'LIG', 'MG', 'N', 'NA', 'O', 'P', 'S', 'ZN', ']', 'replace', 'utf-8']

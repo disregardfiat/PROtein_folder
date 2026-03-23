@@ -55,11 +55,11 @@ from email.utils import formataddr, make_msgid, formatdate
 
 from flask import Flask, request, Response
 
-# Ensure repo root is on path when run via gunicorn
-if __name__ != "__main__":
-    _root = os.path.dirname(os.path.abspath(__file__))
-    if _root not in sys.path:
-        sys.path.insert(0, _root)
+# src layout: package lives under ./src (editable install also works)
+_root = os.path.dirname(os.path.abspath(__file__))
+_src = os.path.join(_root, "src")
+if _src not in sys.path:
+    sys.path.insert(0, _src)
 
 from horizon_physics.proteins.casp_submission import _parse_fasta
 from horizon_physics.proteins import (
@@ -1388,6 +1388,7 @@ def _run_one_job_with_timeout_impl(
 ) -> None:
     """Actual work for one job (called while holding _job_concurrency_semaphore)."""
     repo_root = os.path.dirname(os.path.abspath(__file__))
+    repo_src = os.path.join(repo_root, "src")
     payload = {
         "job_id": job_id,
         "base": base,
@@ -1408,9 +1409,10 @@ def _run_one_job_with_timeout_impl(
         "-c",
         "import sys, os, json\n"
         "sys.path.insert(0, %r)\n"
+        "sys.path.insert(0, %r)\n"
         "with open(sys.argv[1]) as f: payload = json.load(f)\n"
         "from casp_server import _run_one_job_fast_then_hke\n"
-        "_run_one_job_fast_then_hke(sys.argv[1])\n" % repo_root,
+        "_run_one_job_fast_then_hke(sys.argv[1])\n" % (repo_src, repo_root),
         temp_path,
     ]
     try:
@@ -1582,6 +1584,7 @@ def _run_hke_only_with_timeout(
     PREDICTION_TIMEOUT_SEC, we kill it and send the fast-pass result so the user gets something.
     """
     repo_root = os.path.dirname(os.path.abspath(__file__))
+    repo_src = os.path.join(repo_root, "src")
     payload = {
         "job_id": job_id,
         "base": base,
@@ -1608,11 +1611,12 @@ def _run_hke_only_with_timeout(
             "-c",
             "import sys, os, json\n"
             "sys.path.insert(0, %r)\n"
+            "sys.path.insert(0, %r)\n"
             "with open(sys.argv[1]) as f: payload = json.load(f)\n"
             "from casp_server import parse_ligands, _run_hke_only\n"
             "pl = parse_ligands(payload.get('ligand_str') or '') if payload.get('ligand_str') else []\n"
             "_run_hke_only(payload['job_id'], payload['base'], payload['sequences'], payload['seqs'], "
-            "payload.get('to_email'), payload.get('job_title'), pl)\n" % repo_root,
+            "payload.get('to_email'), payload.get('job_title'), pl)\n" % (repo_src, repo_root),
             temp_path,
         ]
         proc = subprocess.Popen(
