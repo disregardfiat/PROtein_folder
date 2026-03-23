@@ -3,10 +3,19 @@ Ligand support: parse ligand input (PDB HETATM, InChI, SMILES) and represent eac
 ligand as a 6-DOF rigid body (LigandAgent) that interacts with the protein via horizon forces.
 
 Tunnel cone/lip plane apply ONLY to the protein chain; ligands are free 6-DOF agents.
+
+**Inputs**
+  - PDB block: ``ATOM``/``HETATM`` (one ``LigandAgent`` per residue block / ``res_name``+``res_seq``).
+  - SMILES or InChI: one line per ligand (requires RDKit for 3D embed + MMFF).
+  - File: :func:`parse_ligands_from_file` (same formats as :func:`parse_ligands`).
+
+**Physics**
+  Z_shell per atom follows element (HQIV) when ``z_list`` is omitted; see :func:`z_shell_for_element`.
 """
 
 from __future__ import annotations
 
+import os
 import re
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
@@ -14,8 +23,49 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 
-# Default z_shell for ligand atoms (carbon-like for horizon)
+# Default z_shell for ligand atoms (carbon-like for horizon) when element unknown
 DEFAULT_LIGAND_Z = 6
+
+# HQIV nuclear shell index proxy from element (same convention as backbone atom typing)
+ELEMENT_TO_Z_SHELL: Dict[str, int] = {
+    "H": 1,
+    "HE": 2,
+    "LI": 3,
+    "B": 5,
+    "C": 6,
+    "N": 7,
+    "O": 8,
+    "F": 9,
+    "NA": 11,
+    "MG": 12,
+    "P": 15,
+    "S": 16,
+    "CL": 17,
+    "K": 19,
+    "CA": 20,
+    "FE": 26,
+    "ZN": 30,
+    "BR": 35,
+    "I": 53,
+}
+
+
+def z_shell_for_element(symbol: str) -> int:
+    """Map element symbol to Z_shell for ``e_tot`` / horizon (first principles bookkeeping)."""
+    raw = symbol.strip().upper()
+    if not raw:
+        return DEFAULT_LIGAND_Z
+    # Prefer 2-letter symbols (CL, CA, …) when present in table; else 1-letter (C, N, …).
+    if len(raw) >= 2:
+        two = raw[:2]
+        if two in ELEMENT_TO_Z_SHELL:
+            return ELEMENT_TO_Z_SHELL[two]
+    return ELEMENT_TO_Z_SHELL.get(raw[0], DEFAULT_LIGAND_Z)
+
+
+def z_list_from_elements(elements: List[str]) -> np.ndarray:
+    """Shape (n,) int32 Z_shell for each atom."""
+    return np.array([z_shell_for_element(e) for e in elements], dtype=np.int32)
 
 
 def _euler_to_rotation(euler: np.ndarray) -> np.ndarray:
@@ -52,13 +102,20 @@ class LigandAgent:
         if pos.ndim == 1:
             pos = pos.reshape(-1, 3)
         self.local_positions = pos  # (N, 3) relative to centroid
-        self.elements = list(elements) if elements else ["C"] * len(self.atom_names)
-        n = len(self.atom_names)
-        if n and len(self.elements) != n:
-            self.elements = (self.elements + ["C"] * n)[:n]
-        self.z_list = np.asarray(z_list, dtype=np.int32) if z_list is not None else np.full(pos.shape[0], DEFAULT_LIGAND_Z)
+        n_atoms = int(pos.shape[0])
+        self.elements = list(elements) if elements else ["C"] * max(len(self.atom_names), n_atoms)
+        if len(self.elements) < n_atoms:
+            self.elements = self.elements + ["C"] * (n_atoms - len(self.elements))
+        elif len(self.elements) > n_atoms:
+            self.elements = self.elements[:n_atoms]
+        if len(self.atom_names) < n_atoms:
+            self.atom_names = [self.atom_names[i] if i < len(self.atom_names) else f"A{i+1:04d}" for i in range(n_atoms)]
+        if z_list is not None:
+            self.z_list = np.asarray(z_list, dtype=np.int32)
+        else:
+            self.z_list = z_list_from_elements(self.elements) if self.elements else np.zeros(0, dtype=np.int32)
         if self.z_list.size != pos.shape[0]:
-            self.z_list = np.full(pos.shape[0], DEFAULT_LIGAND_Z)
+            self.z_list = z_list_from_elements(self.elements) if len(self.elements) == pos.shape[0] else np.full(pos.shape[0], DEFAULT_LIGAND_Z)
         # 6-DOF: translation (Å) and euler ZYX (radians)
         self._t = np.zeros(3, dtype=np.float64)
         self._euler = np.zeros(3, dtype=np.float64)
@@ -109,8 +166,14 @@ def _parse_pdb_hetatm_block(text: str) -> List[Tuple[str, int, str, np.ndarray, 
             x = float(line[30:38])
             y = float(line[38:46])
             z = float(line[46:54])
-            elem = line[76:78].strip() if len(line) >= 78 else "C"
-            out.append((res_name, res_seq, atom_name, np.array([x, y, z], dtype=np.float64), elem or "C"))
+            if len(line) >= 78:
+                elem = line[76:78].strip()
+            else:
+                tail = line[54:].split()
+                elem = tail[-1] if tail and tail[-1].isalpha() and len(tail[-1]) <= 2 else ""
+            if not elem:
+                elem = "C"
+            out.append((res_name, res_seq, atom_name, np.array([x, y, z], dtype=np.float64), elem))
         except (ValueError, IndexError):
             continue
     return out
@@ -182,7 +245,7 @@ def parse_ligands(ligand_str: str) -> List[LigandAgent]:
             agents.append(ag)
         return agents
 
-    # Line-by-line: SMILES or InChI
+    # Line-by-line: SMILES or InChI (not PDB)
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
@@ -198,3 +261,23 @@ def parse_ligands(ligand_str: str) -> List[LigandAgent]:
         agents.append(ag)
 
     return agents
+
+
+def parse_ligands_from_file(path: str) -> List[LigandAgent]:
+    """
+    Load ligand description from a file: PDB (HETATM block) or newline-separated SMILES/InChI.
+
+    Encoding: UTF-8. Returns the same structure as :func:`parse_ligands`.
+    """
+    if not path or not os.path.isfile(path):
+        return []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return parse_ligands(f.read())
+
+
+def ligand_summary(agents: List[LigandAgent]) -> str:
+    """One-line human-readable summary for logs."""
+    if not agents:
+        return "0 ligands"
+    parts = [f"{a.res_name}:{a.n_atoms()}" for a in agents]
+    return f"{len(agents)} ligand(s) [" + ", ".join(parts) + "]"

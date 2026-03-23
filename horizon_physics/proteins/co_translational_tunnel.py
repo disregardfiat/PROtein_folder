@@ -14,7 +14,13 @@ MIT License. Python 3.10+. Numpy.
 from __future__ import annotations
 
 import numpy as np
-from typing import List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+# Cα+bonds+clash energy for line search / reporting (default ``e_tot_ca_with_bonds``).
+EnergyFuncCA = Callable[[np.ndarray, np.ndarray], float]
+
+# k_B in eV/K (same as ``temperature_path_search.K_B_EV_K`` / ``gradient_descent_folding``)
+K_B_EV_K = 8.617333262e-5
 
 # Default tunnel axis is +Z (extrusion direction)
 DEFAULT_TUNNEL_AXIS = np.array([0.0, 0.0, 1.0], dtype=float)
@@ -229,6 +235,7 @@ def run_masked_lbfgs_pass(
     r_bond_min: float = 2.5,
     r_bond_max: float = 6.0,
     hke_above_tunnel_fraction: Optional[float] = 0.5,
+    energy_func_ca: Optional[EnergyFuncCA] = None,
 ) -> Tuple[np.ndarray, int]:
     """
     Run one short HKE (L-BFGS) minimization pass with cone and plane gradient
@@ -236,10 +243,13 @@ def run_masked_lbfgs_pass(
     gradient is zeroed for residues at or below that fraction of tunnel length,
     so HKE only updates the chain above that point (e.g. above 50% of tunnel).
     Returns (positions_opt, n_iter_used).
+
+    energy_func_ca: Optional override for line-search energies (e.g. fast_local_theta).
     """
-    from .folding_energy import e_tot_ca_with_bonds
+    from .folding_energy import e_tot_ca_with_bonds as _e_tot_ca_default
     from .gradient_descent_folding import _project_bonds, _lbfgs_two_loop
 
+    _e_ca = energy_func_ca if energy_func_ca is not None else _e_tot_ca_default
     pos = np.array(positions, dtype=float)
     n = pos.shape[0]
     x = pos.ravel()
@@ -275,7 +285,7 @@ def run_masked_lbfgs_pass(
         else:
             direction = _lbfgs_two_loop(grad, s_list, y_list, m)
         step = 1.0
-        e_curr = e_tot_ca_with_bonds(x.reshape(n, 3), z_list)
+        e_curr = _e_ca(x.reshape(n, 3), z_list)
         c1 = 1e-4
         for _ in range(40):
             x_new = x + step * direction
@@ -283,7 +293,7 @@ def run_masked_lbfgs_pass(
                 x_new.reshape(n, 3), r_min=r_bond_min, r_max=r_bond_max
             )
             x_new = pos_new.ravel()
-            e_new = e_tot_ca_with_bonds(pos_new, z_list)
+            e_new = _e_ca(pos_new, z_list)
             if e_new <= e_curr + c1 * step * np.dot(grad, direction):
                 break
             step *= 0.5
@@ -294,6 +304,65 @@ def run_masked_lbfgs_pass(
         y_list.append(grad_new - grad)
         grad = grad_new
     return x.reshape(n, 3).copy(), max_iter
+
+
+def tunnel_thermal_gradient_relax_segment(
+    positions: np.ndarray,
+    z_list: np.ndarray,
+    ptc_origin: np.ndarray,
+    axis: np.ndarray,
+    tunnel_length: float,
+    cone_half_angle_deg: float,
+    lip_plane_distance: float,
+    grad_func,
+    project_bonds,
+    *,
+    n_steps: int,
+    step_size: float,
+    temperature_k: float,
+    reference_temperature_k: float,
+    noise_fraction: float,
+    r_bond_min: float,
+    r_bond_max: float,
+    hke_above_tunnel_fraction: Optional[float],
+    rng: np.random.Generator,
+    energy_func_ca: Optional[EnergyFuncCA] = None,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    kT-scaled noisy gradient steps on a tunnel segment using the same ``grad_func`` and
+    cone/plane / HKE-fraction masking as ``run_masked_lbfgs_pass`` (consistent with in-tunnel L-BFGS).
+    """
+    from .folding_energy import e_tot_ca_with_bonds as _e_tot_ca_default
+
+    _e_ca = energy_func_ca if energy_func_ca is not None else _e_tot_ca_default
+    pos = np.asarray(positions, dtype=float).copy()
+    kT = K_B_EV_K * float(temperature_k)
+    kT0 = K_B_EV_K * float(reference_temperature_k)
+    t_ratio = max(kT / (kT0 + 1e-30), 1e-6)
+    noise_rms = float(noise_fraction * step_size * np.sqrt(t_ratio))
+    use_hke_fraction = hke_above_tunnel_fraction is not None
+
+    for _ in range(int(n_steps)):
+        g = grad_func(pos, z_list)
+        apply_cone_and_plane_masking(
+            g, pos, ptc_origin, axis, tunnel_length, cone_half_angle_deg, lip_plane_distance
+        )
+        if use_hke_fraction and hke_above_tunnel_fraction is not None:
+            zero_gradient_below_tunnel_fraction(
+                g, pos, ptc_origin, axis, tunnel_length, hke_above_tunnel_fraction
+            )
+        gn = float(np.linalg.norm(g)) + 1e-12
+        pos = pos - (step_size / gn) * g + rng.normal(0.0, noise_rms, pos.shape)
+        pos = project_bonds(pos, r_min=r_bond_min, r_max=r_bond_max)
+
+    e_fin = float(_e_ca(pos, z_list))
+    return pos, {
+        "n_steps": int(n_steps),
+        "temperature_k": float(temperature_k),
+        "noise_rms": noise_rms,
+        "e_final": e_fin,
+        "message": "tunnel_thermal_gradient_relax_segment",
+    }
 
 
 def align_chain_to_tunnel(
@@ -365,6 +434,15 @@ def _segment_pass(
     r_bond_min: float,
     r_bond_max: float,
     hke_above_tunnel_fraction: float,
+    tunnel_thermal_gradient_steps: int,
+    tunnel_thermal_temperature_k: float,
+    tunnel_thermal_reference_temperature_k: float,
+    tunnel_thermal_noise_fraction: float,
+    tunnel_thermal_step_size: float,
+    tunnel_thermal_quick_cap: bool,
+    tunnel_thermal_rng: Optional[np.random.Generator],
+    tunnel_thermal_stats: Optional[Dict[str, Any]],
+    energy_func_ca: Optional[EnergyFuncCA],
 ) -> int:
     """Run one fast-pass + min pass on segment pos[i:j]. Bell = junction (or both if L==2). Returns n_iter."""
     L = j - i
@@ -406,7 +484,41 @@ def _segment_pass(
         r_bond_min=r_bond_min,
         r_bond_max=r_bond_max,
         hke_above_tunnel_fraction=hke_above_tunnel_fraction,
+        energy_func_ca=energy_func_ca,
     )
+    if (
+        tunnel_thermal_gradient_steps > 0
+        and tunnel_thermal_rng is not None
+        and L >= 2
+    ):
+        eff_steps = int(tunnel_thermal_gradient_steps)
+        if tunnel_thermal_quick_cap:
+            eff_steps = min(eff_steps, 12)
+        if eff_steps > 0:
+            pos_seg, _th = tunnel_thermal_gradient_relax_segment(
+                pos_seg,
+                z_seg,
+                ptc_origin,
+                axis,
+                tunnel_length,
+                cone_half_angle_deg,
+                lip_plane_distance,
+                grad_func,
+                project_bonds,
+                n_steps=eff_steps,
+                step_size=float(tunnel_thermal_step_size),
+                temperature_k=float(tunnel_thermal_temperature_k),
+                reference_temperature_k=float(tunnel_thermal_reference_temperature_k),
+                noise_fraction=float(tunnel_thermal_noise_fraction),
+                r_bond_min=r_bond_min,
+                r_bond_max=r_bond_max,
+                hke_above_tunnel_fraction=hke_above_tunnel_fraction,
+                rng=tunnel_thermal_rng,
+                energy_func_ca=energy_func_ca,
+            )
+            if tunnel_thermal_stats is not None:
+                tunnel_thermal_stats["segments"] = int(tunnel_thermal_stats.get("segments", 0)) + 1
+                tunnel_thermal_stats["steps"] = int(tunnel_thermal_stats.get("steps", 0)) + eff_steps
     pos[i:j] = pos_seg
     return n_iter
 
@@ -428,6 +540,15 @@ def _binary_tree_minimize(
     r_bond_min: float,
     r_bond_max: float,
     hke_above_tunnel_fraction: float,
+    tunnel_thermal_gradient_steps: int,
+    tunnel_thermal_temperature_k: float,
+    tunnel_thermal_reference_temperature_k: float,
+    tunnel_thermal_noise_fraction: float,
+    tunnel_thermal_step_size: float,
+    tunnel_thermal_quick_cap: bool,
+    tunnel_thermal_rng: Optional[np.random.Generator],
+    tunnel_thermal_stats: Optional[Dict[str, Any]],
+    energy_func_ca: Optional[EnergyFuncCA] = None,
 ) -> int:
     """Process segment [i:j] in binary-tree order: recurse on halves then relax junction. Returns total n_iter."""
     L = j - i
@@ -442,6 +563,15 @@ def _binary_tree_minimize(
             grad_func, project_bonds,
             fast_pass_steps_per_connection, min_pass_iter_per_connection,
             r_bond_min, r_bond_max, hke_above_tunnel_fraction,
+            tunnel_thermal_gradient_steps,
+            tunnel_thermal_temperature_k,
+            tunnel_thermal_reference_temperature_k,
+            tunnel_thermal_noise_fraction,
+            tunnel_thermal_step_size,
+            tunnel_thermal_quick_cap,
+            tunnel_thermal_rng,
+            tunnel_thermal_stats,
+            energy_func_ca,
         )
         total += _binary_tree_minimize(
             pos, z_list, mid, j,
@@ -449,6 +579,15 @@ def _binary_tree_minimize(
             grad_func, project_bonds,
             fast_pass_steps_per_connection, min_pass_iter_per_connection,
             r_bond_min, r_bond_max, hke_above_tunnel_fraction,
+            tunnel_thermal_gradient_steps,
+            tunnel_thermal_temperature_k,
+            tunnel_thermal_reference_temperature_k,
+            tunnel_thermal_noise_fraction,
+            tunnel_thermal_step_size,
+            tunnel_thermal_quick_cap,
+            tunnel_thermal_rng,
+            tunnel_thermal_stats,
+            energy_func_ca,
         )
     total += _segment_pass(
         pos, z_list, i, j,
@@ -456,6 +595,15 @@ def _binary_tree_minimize(
         grad_func, project_bonds,
         fast_pass_steps_per_connection, min_pass_iter_per_connection,
         r_bond_min, r_bond_max, hke_above_tunnel_fraction,
+        tunnel_thermal_gradient_steps,
+        tunnel_thermal_temperature_k,
+        tunnel_thermal_reference_temperature_k,
+        tunnel_thermal_noise_fraction,
+        tunnel_thermal_step_size,
+        tunnel_thermal_quick_cap,
+        tunnel_thermal_rng,
+        tunnel_thermal_stats,
+        energy_func_ca,
     )
     return total
 
@@ -476,6 +624,14 @@ def co_translational_minimize(
     r_bond_min: float = 2.5,
     r_bond_max: float = 6.0,
     hke_above_tunnel_fraction: float = 0.5,
+    tunnel_thermal_gradient_steps: int = 0,
+    tunnel_thermal_temperature_k: float = 310.0,
+    tunnel_thermal_reference_temperature_k: float = 310.0,
+    tunnel_thermal_noise_fraction: float = 0.2,
+    tunnel_thermal_step_size: float = 0.025,
+    tunnel_thermal_quick_cap: bool = False,
+    tunnel_thermal_seed: Optional[int] = None,
+    energy_func_ca: Optional[EnergyFuncCA] = None,
 ) -> Tuple[np.ndarray, dict]:
     """
     Co-translational minimization: binary-tree schedule (instead of running down the chain
@@ -485,11 +641,22 @@ def co_translational_minimize(
     HKE min pass per segment. Returns (ca_min, info).
     Post-extrusion refinement (full HKE two-stage with no cone/plane) is not done here;
     the caller (minimize_full_chain) runs it when post_extrusion_refine=True.
-    """
-    from .folding_energy import e_tot_ca_with_bonds
 
+    ``tunnel_thermal_gradient_steps``: after each segment's masked L-BFGS pass, run this many
+    kT-noised gradient steps (same masking as L-BFGS). Cheap early in growth because segments
+    are short. Default 0 preserves legacy deterministic tunnel behavior.
+    """
+    from .folding_energy import e_tot_ca_with_bonds as _e_tot_ca_default
+
+    _e_tunnel = energy_func_ca if energy_func_ca is not None else _e_tot_ca_default
     pos = align_chain_to_tunnel(ca_init, ptc_origin, axis)
     n = pos.shape[0]
+    th_stats: Optional[Dict[str, Any]] = None
+    th_rng: Optional[np.random.Generator] = None
+    if int(tunnel_thermal_gradient_steps) > 0:
+        th_stats = {"segments": 0, "steps": 0}
+        th_rng = np.random.default_rng(tunnel_thermal_seed)
+
     total_min_steps = _binary_tree_minimize(
         pos,
         z_list,
@@ -507,14 +674,27 @@ def co_translational_minimize(
         r_bond_min,
         r_bond_max,
         hke_above_tunnel_fraction,
+        int(tunnel_thermal_gradient_steps),
+        float(tunnel_thermal_temperature_k),
+        float(tunnel_thermal_reference_temperature_k),
+        float(tunnel_thermal_noise_fraction),
+        float(tunnel_thermal_step_size),
+        bool(tunnel_thermal_quick_cap),
+        th_rng,
+        th_stats,
+        _e_tunnel,
     )
 
-    e_final = float(e_tot_ca_with_bonds(pos, z_list))
-    info = {
+    e_final = float(_e_tunnel(pos, z_list))
+    info: Dict[str, Any] = {
         "e_final": e_final,
         "e_initial": e_final,
         "n_iter": total_min_steps,
         "success": True,
         "message": "Co-translational tunnel (binary-tree fast-pass + connection-triggered HKE)",
+        "tunnel_thermal_gradient_steps": int(tunnel_thermal_gradient_steps),
     }
+    if th_stats is not None:
+        info["tunnel_thermal_segments"] = int(th_stats.get("segments", 0))
+        info["tunnel_thermal_total_steps"] = int(th_stats.get("steps", 0))
     return pos, info

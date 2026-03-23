@@ -49,6 +49,22 @@ from .grade_folds import ca_rmsd, load_ca_from_pdb, load_ca_and_sequence_from_pd
 from .surface_attachment import find_attachment_point
 from .em_field_pipeline import Atom, EMField, CoTranslationalAssembler, atoms_to_pdb
 from .tunnel_temperature_pipeline import fold_with_tunnel_temperature
+from .lean_ribosome_tunnel_pipeline import fold_lean_ribosome_tunnel, LeanTunnelFoldResult
+from .ligands import (
+    LigandAgent,
+    ligand_summary,
+    parse_ligands,
+    parse_ligands_from_file,
+    z_shell_for_element,
+)
+from .hqiv_long_range import (
+    K_hbond,
+    R_hbond,
+    h_bond_proxy,
+    phi_of_shell,
+    available_modes_nat,
+    total_h_bond_proxy_energy_ca,
+)
 
 # Optional hierarchical kinematic engine (parallel path)
 try:
@@ -111,6 +127,19 @@ __all__ = [
     "CoTranslationalAssembler",
     "atoms_to_pdb",
     "fold_with_tunnel_temperature",
+    "fold_lean_ribosome_tunnel",
+    "LeanTunnelFoldResult",
+    "LigandAgent",
+    "ligand_summary",
+    "parse_ligands",
+    "parse_ligands_from_file",
+    "z_shell_for_element",
+    "K_hbond",
+    "R_hbond",
+    "h_bond_proxy",
+    "phi_of_shell",
+    "available_modes_nat",
+    "total_h_bond_proxy_energy_ca",
     "minimize_full_chain_hierarchical",
     "grade_trajectory",
     "load_trajectory_frames",

@@ -283,6 +283,33 @@ class CoTranslationalAssembler:
                 atoms.append(Atom(name, res_3, resid, np.array(xyz)))
         return atoms
 
+    def load_from_backbone_atoms(
+        self,
+        backbone: List[Tuple[str, np.ndarray]],
+        sequence: str,
+        ss_string: Optional[str] = None,
+    ) -> None:
+        """
+        Load an existing full backbone (N,CA,C,O per residue) without re-placing Cα.
+
+        Used after co-translational tunnel extrusion: positions stay in the same frame;
+        the 3D EM field is rebuilt from these atoms for ``relax_to_convergence`` (no
+        COM shift toward ``tunnel_exit`` unlike ``load_from_fast_assembler``).
+        """
+        seq = _parse_fasta(sequence) if ">" in sequence or "\n" in sequence else sequence
+        seq = "".join(c for c in seq.upper() if c in AA_1to3)
+        if not seq or len(backbone) != 4 * len(seq):
+            self.atoms = []
+            self._sequence = ""
+            self._ss_string = ""
+            return
+        self._sequence = seq
+        if ss_string is None or len(ss_string) != len(seq):
+            ss_string, _ = predict_ss(seq, window=5)
+        self._ss_string = ss_string
+        self.atoms = self._atoms_from_backbone(backbone, seq)
+        self._rebuild_field()
+
     def load_from_fast_assembler(
         self, sequence: str, ss_string: Optional[str] = None
     ) -> None:

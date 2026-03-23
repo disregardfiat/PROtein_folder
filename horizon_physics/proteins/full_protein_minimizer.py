@@ -12,6 +12,7 @@ MIT License. Python 3.10+. Numpy only.
 
 from __future__ import annotations
 
+import functools
 import json
 import signal
 import sys
@@ -79,10 +80,14 @@ def _minimize_bonds_fast(
     k_rg_collapse: Optional[float] = None,
     trajectory_log: Optional[Any] = None,
     on_step_callback: Optional[Callable[[int, np.ndarray], None]] = None,
+    grad_full_extra_kwargs: Optional[Dict[str, Any]] = None,
+    grad_extra_fn: Optional[Callable[[np.ndarray, np.ndarray], np.ndarray]] = None,
+    fast_local_theta: bool = False,
 ) -> Tuple[np.ndarray, Dict[str, float]]:
     """
     Fast minimization for long chains. Default: bonds + full vector-sum horizon (analytical).
     fast_horizon=True: bonds-only (nearest-neighbor), for debugging/speed.
+    fast_local_theta: passed to final ``e_tot_ca_with_bonds`` energy report only.
 
     If collapse=True: two-stage annealing for globule formation.
     - Optional compact init: collapse_init_steps of Rg-only + bond projection.
@@ -137,13 +142,22 @@ def _minimize_bonds_fast(
             if on_step_callback is not None:
                 on_step_callback(total_iter, pos.copy())
 
+    g_extra_kw = dict(grad_full_extra_kwargs or {})
     # Stage 2: refine (tight bonds, no Rg); project into standard [2.5, 6] Å
     for it in range(n_refine):
-        grad = (
-            grad_bonds_only(pos)
-            if fast_horizon
-            else grad_full(pos, z_list, include_bonds=True, include_horizon=True, include_clash=True)
-        )
+        if fast_horizon:
+            grad = grad_bonds_only(pos)
+        else:
+            grad = grad_full(
+                pos,
+                z_list,
+                include_bonds=True,
+                include_horizon=True,
+                include_clash=True,
+                **g_extra_kw,
+            )
+        if grad_extra_fn is not None:
+            grad = grad + grad_extra_fn(pos, z_list)
         g_norm = np.linalg.norm(grad)
         if g_norm < 1e-4:
             break
@@ -156,7 +170,7 @@ def _minimize_bonds_fast(
             on_step_callback(total_iter, pos.copy())
 
     z = np.full(n, 6)
-    e_final = float(e_tot_ca_with_bonds(pos, z))
+    e_final = float(e_tot_ca_with_bonds(pos, z, fast_local_theta=fast_local_theta))
     msg = "Bonds + horizon (fast path)"
     if collapse:
         msg = "Two-stage collapse + refine (long chain)"
@@ -213,6 +227,7 @@ def _refine_ligands_6dof(
     max_steps: int = LIGAND_REFINE_STEPS,
     step_t: float = LIGAND_STEP_T,
     step_ang: float = LIGAND_STEP_ANG,
+    grad_full_kwargs: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Minimize E_tot over ligand 6-DOF only; protein positions fixed. Modifies ligands in place."""
     n_bb = pos_bb.shape[0]
@@ -228,6 +243,11 @@ def _refine_ligands_6dof(
         indices_per_ligand.append(list(range(off, off + n)))
         off += n
 
+    # Match ``minimize_full_chain`` ``grad_full`` screening (``em_scale``, …). The
+    # ``hBondProxy`` FD term is Cα-chain-only; disable it for protein+ligand atom arrays.
+    gkw = dict(grad_full_kwargs or {})
+    gkw["hbond_weight"] = 0.0
+
     for _ in range(max_steps):
         lig_pos = np.concatenate([lig.get_world_positions() for lig in ligands], axis=0)
         combined = np.concatenate([pos_bb, lig_pos], axis=0)
@@ -237,13 +257,118 @@ def _refine_ligands_6dof(
             z_list,
             include_bonds=False,
             include_horizon=True,
-            include_clash=True,
+            **gkw,
         )
         grad[:n_bb] += grad_bonds_only(pos_bb, include_clash=False)
         for lig, indices in zip(ligands, indices_per_ligand):
             F, T = rigid_body_force_torque(combined, grad, indices)
             t, euler = lig.get_6dof()
             lig.set_6dof(t - step_t * F, euler - step_ang * T)
+
+
+def merged_multichain_backbone_atoms(
+    result_and_chain_ids: List[Tuple[Dict[str, object], str]],
+    *,
+    chain_gap: float = 50.0,
+) -> List[Tuple[str, np.ndarray]]:
+    """
+    Concatenate backbone (N,CA,C,O,…) from several minimizer ``result`` dicts with +x offsets,
+    matching the layout used by ``casp_server._merge_pdb_chains`` (chain–chain separation).
+    """
+    chain_mins: List[float] = []
+    for result, _ in result_and_chain_ids:
+        bb = result.get("backbone_atoms") or []
+        if not bb:
+            chain_mins.append(0.0)
+        else:
+            chain_mins.append(min(float(xyz[0]) for _, xyz in bb))
+    out: List[Tuple[str, np.ndarray]] = []
+    prev_max_x = float("-inf")
+    for ci, (result, _) in enumerate(result_and_chain_ids):
+        backbone_atoms = result.get("backbone_atoms") or []
+        sequence = str(result.get("sequence") or "")
+        include_sidechains = bool(result.get("include_sidechains", False))
+        n_res = int(result.get("n_res") or 0)
+        if not backbone_atoms or not sequence or n_res <= 0:
+            continue
+        offset_x = max(0.0, prev_max_x + chain_gap - chain_mins[ci])
+        idx = 0
+        chain_max_x = float("-inf")
+        for res_id in range(1, n_res + 1):
+            res_1 = sequence[res_id - 1]
+            n_atoms_this = (5 if res_1 != "G" else 4) if include_sidechains else 4
+            for _ in range(n_atoms_this):
+                name, xyz = backbone_atoms[idx]
+                x = float(xyz[0]) + offset_x
+                y, z = float(xyz[1]), float(xyz[2])
+                chain_max_x = max(chain_max_x, x)
+                out.append((name, np.asarray([x, y, z], dtype=np.float64)))
+                idx += 1
+        prev_max_x = chain_max_x
+    return out
+
+
+def refine_ligands_on_multichain_results(
+    result_and_chain_ids: List[Tuple[Dict[str, object], str]],
+    ligands: List[LigandAgent],
+    *,
+    chain_gap: float = 50.0,
+    grad_full_kwargs: Optional[Dict[str, Any]] = None,
+    ligand_refine_steps: int = LIGAND_REFINE_STEPS,
+    ligand_step_t: float = LIGAND_STEP_T,
+    ligand_step_ang: float = LIGAND_STEP_ANG,
+) -> None:
+    """
+    Place ligand centroid at the merged-complex backbone COM, then 6-DOF horizon refinement
+    against the fixed multichain backbone (same physics as single-chain ``include_ligands``).
+    Modifies ``ligands`` in place.
+    """
+    if not ligands:
+        return
+    merged = merged_multichain_backbone_atoms(result_and_chain_ids, chain_gap=chain_gap)
+    if not merged:
+        return
+    pos_bb, z_bb = _full_backbone_positions_and_z(merged)
+    protein_com = np.mean(pos_bb, axis=0)
+    for lig in ligands:
+        t, euler = lig.get_6dof()
+        lig.set_6dof(protein_com.copy(), euler)
+    _refine_ligands_6dof(
+        pos_bb,
+        z_bb,
+        ligands,
+        max_steps=ligand_refine_steps,
+        step_t=ligand_step_t,
+        step_ang=ligand_step_ang,
+        grad_full_kwargs=grad_full_kwargs,
+    )
+
+
+def pdb_hetatm_lines_for_ligands(
+    ligands: List[LigandAgent],
+    *,
+    start_atom_id: int,
+    ligand_chain_id: str,
+) -> Tuple[List[str], int]:
+    """PDB HETATM lines for all ligands; returns (lines, next_atom_id)."""
+    lines: List[str] = []
+    atom_id = start_atom_id
+
+    def _pdb_coord(x: float) -> str:
+        s = f"{float(x):8.3f}"
+        return s[-8:] if len(s) > 8 else s
+
+    for res_id_het, lig in enumerate(ligands, start=1):
+        res_3 = (lig.res_name or "LIG")[:3]
+        for a, (name, xyz) in enumerate(zip(lig.atom_names, lig.get_world_positions())):
+            elem = (lig.elements[a] if a < len(lig.elements) else "C")[:2].rjust(2)
+            line = (
+                f"HETATM{atom_id:5d}  {name:2s}  {res_3:3s} {ligand_chain_id}{res_id_het:4d}    "
+                f"{_pdb_coord(xyz[0])}{_pdb_coord(xyz[1])}{_pdb_coord(xyz[2])}  1.00  0.00      {elem:>2s}"
+            )
+            lines.append(line[:80] if len(line) > 80 else line)
+            atom_id += 1
+    return lines, atom_id
 
 
 def minimize_full_chain(
@@ -269,8 +394,44 @@ def minimize_full_chain(
     cone_half_angle_deg: float = 12.0,
     lip_plane_distance: float = 0.0,
     post_extrusion_refine: bool = True,
+    post_extrusion_refine_mode: str = "em_treetorque",
+    post_extrusion_em_max_steps: Optional[int] = None,
+    post_extrusion_treetorque_phases: int = 8,
+    post_extrusion_treetorque_n_steps: int = 200,
+    refinement_temperature_k: float = 310.0,
+    post_extrusion_discrete_metropolis: bool = False,
+    post_extrusion_discrete_seed: Optional[int] = None,
+    post_extrusion_anneal: bool = False,
+    post_extrusion_anneal_schedule_k: Optional[Tuple[float, ...]] = None,
+    post_extrusion_langevin_steps: int = 0,
+    post_extrusion_langevin_noise_fraction: float = 0.2,
+    post_extrusion_max_disp_floor: float = 0.25,
+    post_extrusion_max_rounds: int = 32,
+    fast_pass_steps_per_connection: int = 5,
+    min_pass_iter_per_connection: int = 15,
     tunnel_axis: Optional[np.ndarray] = None,
     hke_above_tunnel_fraction: float = 0.5,
+    tunnel_thermal_gradient_steps: int = 0,
+    tunnel_thermal_noise_fraction: float = 0.2,
+    tunnel_thermal_step_size: Optional[float] = None,
+    tunnel_thermal_reference_temperature_k: float = 310.0,
+    tunnel_thermal_seed: Optional[int] = None,
+    em_scale: float = 1.0,
+    kappa_dihedral: float = 0.0,
+    hbond_weight: float = 0.0,
+    hbond_shell_m: int = 3,
+    hbond_min_seq_sep: int = 3,
+    hbond_max_pairs: int = 200,
+    hbond_dist_cutoff: float = 15.0,
+    fast_local_theta: bool = False,
+    horizon_neighbor_cutoff: Optional[float] = None,
+    collective_kink_weight: float = 0.0,
+    collective_kink_m: int = 3,
+    collective_kink_theta_ref_rad: Optional[float] = None,
+    collective_kink_use_ss_mask: bool = False,
+    ligand_refine_steps: int = LIGAND_REFINE_STEPS,
+    ligand_step_t: float = LIGAND_STEP_T,
+    ligand_step_ang: float = LIGAND_STEP_ANG,
 ) -> Dict[str, object]:
     """
     Full-chain minimization: minimize E_tot over Cα, then rebuild backbone.
@@ -297,9 +458,44 @@ def minimize_full_chain(
         tunnel_length: Length of tunnel in Å along extrusion axis (default 25.0). Residues with Cα inside this segment are cone-constrained.
         cone_half_angle_deg: Half-angle of the cone in degrees (default 12.0). Cα inside the tunnel must stay within this cone from the peptidyl transferase center.
         lip_plane_distance: Extra distance in Å beyond tunnel_length for the lip plane (default 0.0). Lip is at tunnel_length + lip_plane_distance along the axis.
-        post_extrusion_refine: When simulate_ribosome_tunnel=True, if True (default), run a final full HKE collapse/refine stage once the full chain is extruded: cone/plane constraints are removed and the existing two-stage logic (Rg-pull + horizon refine) is applied repeatedly until no Cα moved more than 0.5 Å per 100 residues between runs (adaptive threshold).
+        post_extrusion_refine: When simulate_ribosome_tunnel=True, if True (default), run post-extrusion refinement after the chain leaves the cone/plane (see ``post_extrusion_refine_mode``).
+        post_extrusion_refine_mode: ``"em_treetorque"`` (default) = 3D EM-field ``relax_to_convergence`` with ``alternate_hke=False`` (no ``grad_full`` Cα step), then discrete ``run_discrete_refinement`` (tree-torque). ``"hke"`` = legacy repeated ``_minimize_bonds_fast`` / L-BFGS rounds. ``"none"`` = skip.
+        post_extrusion_em_max_steps: Cap on EM relax steps (``None`` = length-scaled inside ``refine_ca_post_tunnel_em_treetorque``).
+        post_extrusion_treetorque_phases: Max phases for ``run_discrete_refinement`` (when mode is ``em_treetorque``).
+        post_extrusion_treetorque_n_steps: Inner discrete steps per phase cap (Metropolis loop length).
+        refinement_temperature_k: Kelvin-like scale for ``run_discrete_refinement`` and thermal Cα relax when post mode is ``em_treetorque``.
+        post_extrusion_discrete_metropolis: If True, discrete φ/ψ moves use Metropolis at ``refinement_temperature_k`` (else greedy downhill).
+        post_extrusion_discrete_seed: RNG seed for Metropolis / thermal relax (``None`` = non-deterministic stream).
+        post_extrusion_anneal: If True and post mode is ``em_treetorque``, run a short multi-stage Metropolis cool-down instead of one discrete pass (see ``post_extrusion_anneal_schedule_k``).
+        post_extrusion_anneal_schedule_k: Optional Kelvin schedule (≥2 values, high→low); last stage should match ``refinement_temperature_k`` for consistent Langevin tail.
+        post_extrusion_langevin_steps: After discrete refine, number of ``thermal_gradient_relax_ca`` steps (0 = off).
+        post_extrusion_langevin_noise_fraction: Scales RMS of Gaussian noise vs ``step_size`` in thermal relax.
+        post_extrusion_max_disp_floor: (``hke`` mode only) Minimum motion threshold (Å) for stopping post-extrusion iterations.
+        post_extrusion_max_rounds: (``hke`` mode only) Safety cap on outer rounds (each runs one ``_minimize_bonds_fast`` collapse+refine).
+        fast_pass_steps_per_connection: Co-translational rigid-group + bell gradient steps per segment (set 0 to skip).
+        min_pass_iter_per_connection: L-BFGS iterations per segment in the tunnel (connection-triggered “HKE” pass; set 0 to skip).
         tunnel_axis: (3,) unit vector for tunnel axis; default +Z. Chain is aligned so N-terminus is at origin and extrusion is along this axis.
         hke_above_tunnel_fraction: When simulate_ribosome_tunnel=True, HKE (connection-triggered L-BFGS) is applied only to residues above this fraction of the tunnel length (default 0.5 = 50%). The chain is built with the fast method (rigid group + bell-end); only the part above this threshold is updated by the min pass.
+        tunnel_thermal_gradient_steps: When simulate_ribosome_tunnel=True and >0, after each binary-tree segment's masked L-BFGS pass, run this many kT-noised gradient steps with the same cone/plane/HKE-fraction masking as L-BFGS. Uses ``refinement_temperature_k`` as the thermal scale. Default 0 = deterministic tunnel (legacy).
+        tunnel_thermal_noise_fraction: RMS multiplier for Gaussian Cα noise vs step size (same role as post-extrusion Langevin).
+        tunnel_thermal_step_size: Cα step scale; ``None`` → 0.022 if ``quick`` else 0.028.
+        tunnel_thermal_reference_temperature_k: Denominator for √(T/T_ref) noise scaling (typically 310 K).
+        tunnel_thermal_seed: RNG seed for tunnel thermal steps; ``None`` uses ``post_extrusion_discrete_seed`` if set, else non-deterministic.
+        em_scale: Multiplier on horizon (EM) pole strength in grad_full (default 1). Use 1/ε_r for bulk water screening (HQIV Lean `waterDielectricValley`).
+        kappa_dihedral: Weight on Lean `foldEnergyWithDihedral` correction κ(1−cos Δθ) on φ/ψ toward the HQIV α Ramachandran basin (default 0 = off).
+        hbond_weight: Weight on Lean ``HQIVLongRange`` ``hBondProxy`` gradient (finite differences on Cα; default 0 = off). Expensive for long chains.
+        hbond_shell_m: Nuclear/shell index ``m`` for ``K_hbond m``, ``R_hbond m`` (default 3).
+        hbond_min_seq_sep, hbond_max_pairs, hbond_dist_cutoff: Pair list for ``total_h_bond_proxy_energy_ca``.
+        fast_local_theta: If True, evaluate Σ ħc/Θ_i + damping in ``e_tot_ca_with_bonds`` via batched
+            nearest-neighbor distances (same Θ_i as the legacy loop, faster for long chains).
+        horizon_neighbor_cutoff: If set, cap the spatial neighbor list radius (Å) in ``grad_full`` horizon
+            forces below module default ``CUTOFF`` (prunes weak long-range pairs; faster, approximate).
+        collective_kink_weight: Weight on Lean ``HQIVCollectiveModes`` Cα kink budget (0 = off).
+        collective_kink_m: Shell index ``m`` for ``K_multipole``.
+        collective_kink_theta_ref_rad: Interior Cα bend reference (rad); default from HQIV α-helix trace.
+        collective_kink_use_ss_mask: If True, only apply kink budget at residues predicted ``H`` (``predict_ss``).
+        ligand_refine_steps, ligand_step_t, ligand_step_ang: Rigid-body refinement of ligands when
+            ``include_ligands`` is True (``grad_full`` uses same ``em_scale`` as the backbone; ``hbond_weight`` is forced off).
 
     Returns:
         dict with:
@@ -331,6 +527,26 @@ def minimize_full_chain(
         ca_init = np.asarray(ca_init, dtype=float)
         assert ca_init.shape == (n_res, 3)
     z_ca = _z_list_ca(seq)
+
+    collective_kink_ss_mask_np: Optional[np.ndarray] = None
+    if collective_kink_weight > 0.0 and collective_kink_use_ss_mask:
+        if ss_string is not None and len(ss_string) == n_res:
+            sk = ss_string
+        else:
+            from .casp_submission import predict_ss
+
+            sk, _ = predict_ss(seq, window=5)
+        collective_kink_ss_mask_np = np.array([c.upper() == "H" for c in sk], dtype=bool)
+
+    _e_tot_bind_kw: Dict[str, Any] = {"fast_local_theta": bool(fast_local_theta)}
+    if collective_kink_weight > 0.0:
+        _e_tot_bind_kw["collective_kink_weight"] = float(collective_kink_weight)
+        _e_tot_bind_kw["collective_kink_m"] = int(collective_kink_m)
+        if collective_kink_theta_ref_rad is not None:
+            _e_tot_bind_kw["collective_kink_theta_ref_rad"] = float(collective_kink_theta_ref_rad)
+        if collective_kink_ss_mask_np is not None:
+            _e_tot_bind_kw["collective_kink_ss_mask"] = collective_kink_ss_mask_np
+
     if quick:
         include_sidechains = False
         side_chain_pack = False
@@ -380,12 +596,77 @@ def minimize_full_chain(
         if hasattr(signal, "SIGUSR1"):
             signal.signal(signal.SIGUSR1, _handler_dump_only)
 
+    _gf_kw: Dict[str, Any] = {
+        "em_scale": em_scale,
+        "hbond_weight": hbond_weight,
+        "hbond_shell_m": hbond_shell_m,
+        "hbond_min_seq_sep": hbond_min_seq_sep,
+        "hbond_max_pairs": hbond_max_pairs,
+        "hbond_dist_cutoff": hbond_dist_cutoff,
+    }
+    if horizon_neighbor_cutoff is not None:
+        _gf_kw["neighbor_cutoff"] = float(horizon_neighbor_cutoff)
+    if collective_kink_weight > 0.0:
+        _gf_kw["collective_kink_weight"] = float(collective_kink_weight)
+        _gf_kw["collective_kink_m"] = int(collective_kink_m)
+        if collective_kink_theta_ref_rad is not None:
+            _gf_kw["collective_kink_theta_ref_rad"] = float(collective_kink_theta_ref_rad)
+        if collective_kink_ss_mask_np is not None:
+            _gf_kw["collective_kink_ss_mask"] = collective_kink_ss_mask_np
+
+    _e_ca_for_line_search = functools.partial(e_tot_ca_with_bonds, **_e_tot_bind_kw)
+
     try:
+        def _grad_ca_with_lean(pos: np.ndarray, z: np.ndarray, *, include_horizon: bool = True) -> np.ndarray:
+            g = grad_full(
+                pos,
+                z,
+                include_bonds=True,
+                include_horizon=include_horizon,
+                include_clash=True,
+                **_gf_kw,
+            )
+            # Dihedral / backbone reconstruction needs one Cα per residue; only apply when
+            # the coordinate block matches the full sequence (co-translational segments are shorter).
+            if kappa_dihedral > 0 and pos.shape[0] == len(seq):
+                from .hqiv_lean_folding import grad_dihedral_penalty_ca_fd
+
+                g = g + grad_dihedral_penalty_ca_fd(pos, seq, kappa_dihedral)
+            return g
+
+        def _e_ca_with_lean(pos: np.ndarray, z: np.ndarray) -> float:
+            e = float(e_tot_ca_with_bonds(pos, z, **_e_tot_bind_kw))
+            if kappa_dihedral > 0:
+                from .hqiv_lean_folding import dihedral_penalty_from_ca
+
+                e += dihedral_penalty_from_ca(pos, seq, kappa=kappa_dihedral)
+            return e
+
+        _grad_extra_opt: Optional[Callable[[np.ndarray, np.ndarray], np.ndarray]] = None
+        if kappa_dihedral > 0:
+            from .hqiv_lean_folding import grad_dihedral_penalty_ca_fd as _grad_dihedral_fd
+
+            def _grad_extra_opt(pos: np.ndarray, z: np.ndarray) -> np.ndarray:
+                return _grad_dihedral_fd(pos, seq, kappa_dihedral)
+
+        _bond_refine_extras = {
+            "grad_full_extra_kwargs": dict(_gf_kw),
+            "grad_extra_fn": _grad_extra_opt,
+        }
+
         # Co-translational ribosome tunnel mode: cone + lip plane, fast-pass spaghetti, connection-triggered HKE
         if simulate_ribosome_tunnel:
             ptc_origin = np.zeros(3)
             axis = _tunnel._normalize_axis(tunnel_axis) if tunnel_axis is not None else _tunnel.DEFAULT_TUNNEL_AXIS.copy()
-            grad_func = lambda pos, z: grad_full(pos, z, include_bonds=True, include_horizon=True, include_clash=True)
+            grad_func = lambda pos, z: _grad_ca_with_lean(pos, z, include_horizon=True)
+            _th_step = tunnel_thermal_step_size
+            if _th_step is None:
+                _th_step = 0.022 if quick else 0.028
+            _th_seed = (
+                tunnel_thermal_seed
+                if tunnel_thermal_seed is not None
+                else post_extrusion_discrete_seed
+            )
             ca_min, info = _tunnel.co_translational_minimize(
                 ca_init,
                 z_ca,
@@ -397,44 +678,103 @@ def minimize_full_chain(
                 grad_func=grad_func,
                 project_bonds=_project_bonds,
                 n_bell=2,
-                fast_pass_steps_per_connection=5,
-                min_pass_iter_per_connection=15,
+                fast_pass_steps_per_connection=fast_pass_steps_per_connection,
+                min_pass_iter_per_connection=min_pass_iter_per_connection,
                 r_bond_min=2.5,
                 r_bond_max=6.0,
                 hke_above_tunnel_fraction=hke_above_tunnel_fraction,
+                tunnel_thermal_gradient_steps=int(tunnel_thermal_gradient_steps),
+                tunnel_thermal_temperature_k=float(refinement_temperature_k),
+                tunnel_thermal_reference_temperature_k=float(tunnel_thermal_reference_temperature_k),
+                tunnel_thermal_noise_fraction=float(tunnel_thermal_noise_fraction),
+                tunnel_thermal_step_size=float(_th_step),
+                tunnel_thermal_quick_cap=bool(quick),
+                tunnel_thermal_seed=_th_seed,
+                energy_func_ca=_e_ca_for_line_search,
             )
             current_for_dump["ca"] = ca_min.copy()
-            # Post-extrusion refinement: full HKE two-stage (no cone/plane), repeat until no atom moved > post_extrusion_max_disp
+            # Post-extrusion: default EM 3D field + tree-torque (no grad_full HKE); optional legacy HKE loop.
             if post_extrusion_refine:
-                total_refine_iter = 0
-                post_extrusion_max_disp = 0.5 * (n_res / 100.0)  # Å; adaptive: 0.5 Å per 100 residues
-                def _update_dump(_step: int, pos: np.ndarray) -> None:
-                    current_for_dump["ca"] = pos.copy()
-                while True:
-                    ca_prev = ca_min.copy()
-                    ca_min, info_refine = _minimize_bonds_fast(
+                mode = (post_extrusion_refine_mode or "em_treetorque").strip().lower()
+                if mode not in ("none", "hke", "em_treetorque"):
+                    mode = "em_treetorque"
+                if mode == "none":
+                    info = {
+                        **info,
+                        "message": "Co-translational tunnel (no post-extrusion refine)",
+                        "post_extrusion_refine_mode": "none",
+                    }
+                elif mode == "hke":
+                    total_refine_iter = 0
+                    post_extrusion_max_disp = max(
+                        float(post_extrusion_max_disp_floor),
+                        0.5 * (n_res / 100.0),
+                    )
+                    post_extrusion_rounds = 0
+
+                    def _update_dump(_step: int, pos: np.ndarray) -> None:
+                        current_for_dump["ca"] = pos.copy()
+
+                    while True:
+                        ca_prev = ca_min.copy()
+                        ca_min, info_refine = _minimize_bonds_fast(
+                            ca_min,
+                            z_ca,
+                            max_iter=long_iter,
+                            fast_horizon=fast_horizon,
+                            collapse=True,
+                            collapse_frac=0.5,
+                            loose_r_max=8.0,
+                            collapse_init_steps=init_steps,
+                            k_rg_collapse=k_rg_collapse,
+                            trajectory_log=traj_file,
+                            on_step_callback=_update_dump,
+                            fast_local_theta=fast_local_theta,
+                            **_bond_refine_extras,
+                        )
+                        current_for_dump["ca"] = ca_min.copy()
+                        total_refine_iter += info_refine.get("n_iter", 0)
+                        max_disp = np.max(np.linalg.norm(ca_min - ca_prev, axis=1))
+                        post_extrusion_rounds += 1
+                        if max_disp <= post_extrusion_max_disp:
+                            break
+                        if post_extrusion_rounds >= post_extrusion_max_rounds:
+                            break
+                    info = {
+                        **info_refine,
+                        "message": "Co-translational tunnel + post-extrusion HKE refine",
+                        "n_iter": info.get("n_iter", 0) + total_refine_iter,
+                        "post_extrusion_rounds": post_extrusion_rounds,
+                        "post_extrusion_max_disp_threshold": post_extrusion_max_disp,
+                        "post_extrusion_refine_mode": "hke",
+                    }
+                else:
+                    from .post_tunnel_em_treetorque import refine_ca_post_tunnel_em_treetorque
+
+                    ca_min, em_tt_info = refine_ca_post_tunnel_em_treetorque(
                         ca_min,
-                        z_ca,
-                        max_iter=long_iter,
-                        fast_horizon=fast_horizon,
-                        collapse=True,
-                        collapse_frac=0.5,
-                        loose_r_max=8.0,
-                        collapse_init_steps=init_steps,
-                        k_rg_collapse=k_rg_collapse,
-                        trajectory_log=traj_file,
-                        on_step_callback=_update_dump,
+                        seq,
+                        quick=quick,
+                        temperature=float(refinement_temperature_k),
+                        em_max_steps=post_extrusion_em_max_steps,
+                        treetorque_phases=int(post_extrusion_treetorque_phases),
+                        treetorque_n_steps=int(post_extrusion_treetorque_n_steps),
+                        discrete_use_metropolis=bool(post_extrusion_discrete_metropolis),
+                        discrete_seed=post_extrusion_discrete_seed,
+                        post_extrusion_anneal=bool(post_extrusion_anneal),
+                        post_extrusion_anneal_schedule_k=post_extrusion_anneal_schedule_k,
+                        langevin_steps=int(post_extrusion_langevin_steps),
+                        langevin_noise_fraction=float(post_extrusion_langevin_noise_fraction),
+                        grad_full_extra_kwargs=dict(_gf_kw),
                     )
                     current_for_dump["ca"] = ca_min.copy()
-                    total_refine_iter += info_refine.get("n_iter", 0)
-                    max_disp = np.max(np.linalg.norm(ca_min - ca_prev, axis=1))
-                    if max_disp <= post_extrusion_max_disp:
-                        break
-                info = {
-                    **info_refine,
-                    "message": "Co-translational tunnel + post-extrusion HKE refine",
-                    "n_iter": info.get("n_iter", 0) + total_refine_iter,
-                }
+                    info = {
+                        **info,
+                        "message": em_tt_info.get("message", "post-extrusion EM + tree-torque"),
+                        "n_iter": info.get("n_iter", 0),
+                        "post_extrusion_refine_mode": "em_treetorque",
+                        **{k: v for k, v in em_tt_info.items() if k != "message"},
+                    }
             elif traj_file is not None:
                 write_trajectory_frame(traj_file, 0, ca_min)
         # Standard HKE path (unchanged): fast path for long chains or L-BFGS for short
@@ -452,6 +792,8 @@ def minimize_full_chain(
                 k_rg_collapse=k_rg_collapse,
                 trajectory_log=traj_file,
                 on_step_callback=_update_dump_long if signal_dump_path else None,
+                fast_local_theta=fast_local_theta,
+                **_bond_refine_extras,
             )
         else:
             def _traj_cb(step: int, pos: np.ndarray) -> None:
@@ -462,8 +804,8 @@ def minimize_full_chain(
                 z_ca,
                 max_iter=max_iter,
                 gtol=gtol,
-                energy_func=e_tot_ca_with_bonds,
-                grad_func=lambda pos, z: grad_full(pos, z, include_bonds=True, include_horizon=not fast_horizon, include_clash=True),
+                energy_func=_e_ca_with_lean if kappa_dihedral > 0 else _e_ca_for_line_search,
+                grad_func=lambda pos, z: _grad_ca_with_lean(pos, z, include_horizon=not fast_horizon),
                 project_bonds=True,
                 r_bond_min=2.5,
                 r_bond_max=6.0,
@@ -489,7 +831,15 @@ def minimize_full_chain(
             t, euler = lig.get_6dof()
             lig.set_6dof(protein_com.copy(), euler)
         ligand_list = list(ligands)
-        _refine_ligands_6dof(pos_bb, z_bb, ligand_list)
+        _refine_ligands_6dof(
+            pos_bb,
+            z_bb,
+            ligand_list,
+            max_steps=int(ligand_refine_steps),
+            step_t=float(ligand_step_t),
+            step_ang=float(ligand_step_ang),
+            grad_full_kwargs=dict(_gf_kw),
+        )
 
     out = {
         "ca_min": ca_min,
@@ -842,6 +1192,7 @@ def full_chain_to_pdb(
     result: Dict[str, object],
     chain_id: str = "A",
     ligands: Optional[List[LigandAgent]] = None,
+    ligand_chain_id: Optional[str] = None,
 ) -> str:
     """Format minimizer result as PDB string (MODEL 1 ... ENDMDL END). Protein ATOM records then ligand HETATM if ligands provided."""
     backbone_atoms = result["backbone_atoms"]
@@ -851,6 +1202,7 @@ def full_chain_to_pdb(
         ligands = result.get("ligands") or []
     if not backbone_atoms and not ligands:
         return "MODEL     1\nENDMDL\nEND\n"
+    het_chain = ligand_chain_id if ligand_chain_id is not None else chain_id
     lines = ["MODEL     1"]
     atom_id = 1
     n_res = result["n_res"]
@@ -876,7 +1228,7 @@ def full_chain_to_pdb(
         for a, (name, xyz) in enumerate(zip(lig.atom_names, lig.get_world_positions())):
             elem = (lig.elements[a] if a < len(lig.elements) else "C")[:2].rjust(2)
             line = (
-                f"HETATM{atom_id:5d}  {name:2s}  {res_3:3s} {chain_id}{res_id_het:4d}    "
+                f"HETATM{atom_id:5d}  {name:2s}  {res_3:3s} {het_chain}{res_id_het:4d}    "
                 f"{_pdb_coord(xyz[0])}{_pdb_coord(xyz[1])}{_pdb_coord(xyz[2])}  1.00  0.00      {elem:>2s}"
             )
             lines.append(line[:80] if len(line) > 80 else line)

@@ -1,0 +1,19 @@
+[
+  {
+    "target_id": "T1235",
+    "n_res": 114,
+    "n_res_target_full": 115,
+    "refine_truncated_to": 114,
+    "pdb_code": "8qpq",
+    "seconds": 2.289744180001435,
+    "pred_pdb": "/home/jr/Repos/PROtien/.casp_grade_outputs/T1235_pred.pdb",
+    "gold_pdb": "/home/jr/Repos/PROtien/.casp_grade_cache/8qpq_ca_from_cif.pdb",
+    "error": null,
+    "ca_rmsd_ang": 0.07615863469308605,
+    "n_graded": 114,
+    "fast_local_theta": true,
+    "horizon_neighbor_cutoff": null,
+    "refine_from_gold": true,
+    "used_gold_ca_init": true
+  }
+]

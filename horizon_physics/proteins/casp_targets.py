@@ -260,15 +260,202 @@ def fetch_experimental_pdb(
         with open(path, "wb") as f:
             f.write(data)
         return path
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        return None
     except (urllib.error.URLError, OSError):
         return None
+
+
+def _mmcif_count_ca_per_chain(cif_path: str) -> Dict[str, int]:
+    """Count Cα atoms per auth_asym_id in the first _atom_site loop."""
+    counts: Dict[str, int] = {}
+    try:
+        with open(cif_path, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return counts
+    i = 0
+    while i < len(lines):
+        if lines[i].strip() != "loop_":
+            i += 1
+            continue
+        j = i + 1
+        col_lines: List[str] = []
+        while j < len(lines) and lines[j].strip().startswith("_atom_site."):
+            col_lines.append(lines[j].strip())
+            j += 1
+        if not col_lines:
+            i += 1
+            continue
+        short_names = [cl.split(".", 1)[-1].strip() for cl in col_lines]
+        need = ("label_atom_id", "auth_asym_id")
+        if not all(n in short_names for n in need):
+            i = j
+            continue
+        ix = {n: short_names.index(n) for n in need}
+        for k in range(j, len(lines)):
+            line = lines[k].strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("loop_") or line.startswith("_"):
+                break
+            if not (line.startswith("ATOM") or line.startswith("HETATM")):
+                continue
+            parts = line.split()
+            if len(parts) < len(short_names):
+                continue
+            if parts[ix["label_atom_id"]] != "CA":
+                continue
+            ch = parts[ix["auth_asym_id"]]
+            counts[ch] = counts.get(ch, 0) + 1
+        return counts
+    return counts
+
+
+def _mmcif_atom_site_ca_to_pdb(
+    cif_path: str,
+    pdb_out: str,
+    *,
+    chain_preference: Optional[str] = "A",
+) -> bool:
+    """
+    Minimal mmCIF → PDB (Cα only) for grading when wwPDB has no legacy .pdb file.
+    Uses the first `loop_` + `_atom_site` block; keeps CA rows, optionally first chain.
+    """
+    try:
+        with open(cif_path, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return False
+    i = 0
+    while i < len(lines):
+        if lines[i].strip() != "loop_":
+            i += 1
+            continue
+        j = i + 1
+        col_lines: List[str] = []
+        while j < len(lines) and lines[j].strip().startswith("_atom_site."):
+            col_lines.append(lines[j].strip())
+            j += 1
+        if not col_lines:
+            i += 1
+            continue
+        short_names = []
+        for cl in col_lines:
+            part = cl.split(".", 1)[-1].strip()
+            short_names.append(part)
+        need = ("label_atom_id", "Cartn_x", "Cartn_y", "Cartn_z", "auth_seq_id", "auth_asym_id")
+        if not all(n in short_names for n in need):
+            i = j
+            continue
+        ix = {n: short_names.index(n) for n in need}
+        serial = 0
+        out: List[str] = []
+        for k in range(j, len(lines)):
+            line = lines[k].strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("loop_") or line.startswith("_"):
+                break
+            if not (line.startswith("ATOM") or line.startswith("HETATM")):
+                continue
+            parts = line.split()
+            if len(parts) < len(short_names):
+                continue
+            if parts[ix["label_atom_id"]] != "CA":
+                continue
+            ch = parts[ix["auth_asym_id"]]
+            if chain_preference is not None and ch != chain_preference:
+                continue
+            try:
+                x = float(parts[ix["Cartn_x"]])
+                y = float(parts[ix["Cartn_y"]])
+                z = float(parts[ix["Cartn_z"]])
+                rid = int(parts[ix["auth_seq_id"]])
+            except (ValueError, IndexError):
+                continue
+            serial += 1
+            ch1 = (ch + "A")[:1]
+            out.append(
+                f"ATOM  {serial:5d}  CA  ALA {ch1}{rid:4d}    "
+                f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           C  \n"
+            )
+        if not out:
+            i = j
+            continue
+        with open(pdb_out, "w") as wf:
+            wf.write("REMARK 999 Cα-only from mmCIF for HQIV grading\n")
+            wf.writelines(out)
+        return True
+    return False
+
+
+def fetch_experimental_pdb_or_mmcif(
+    pdb_code: str,
+    cache_dir: str,
+    timeout: int = 30,
+    target_n_res: Optional[int] = None,
+) -> Optional[str]:
+    """
+    Download experimental coordinates: prefer legacy .pdb; if missing (404 / CIF-only entry),
+    download .cif and write a minimal Cα-only .pdb for grading.
+    """
+    pdb_code = pdb_code.lower().strip()
+    if len(pdb_code) != 4:
+        return None
+    os.makedirs(cache_dir, exist_ok=True)
+    legacy = fetch_experimental_pdb(pdb_code, cache_dir, timeout=timeout)
+    if legacy is not None and os.path.isfile(legacy):
+        try:
+            with open(legacy, "rb") as f:
+                head = f.read(200)
+            if b"404" in head or b"Not Found" in head or b"<html" in head.lower():
+                os.remove(legacy)
+            else:
+                return legacy
+        except OSError:
+            return legacy
+
+    cif_path = os.path.join(cache_dir, f"{pdb_code}.cif")
+    if not os.path.isfile(cif_path):
+        url = f"{RCSB_DOWNLOAD}/{pdb_code}.cif"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "HQIV-CASP-Server/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = resp.read()
+            with open(cif_path, "wb") as f:
+                f.write(data)
+        except (urllib.error.URLError, OSError):
+            return None
+
+    ca_pdb = os.path.join(cache_dir, f"{pdb_code}_ca_from_cif.pdb")
+    chains = _mmcif_count_ca_per_chain(cif_path)
+    chain_order: List[Optional[str]] = []
+    if target_n_res is not None and chains:
+        # Prefer chain whose Cα count is closest to CASP sequence length
+        best = sorted(
+            chains.items(),
+            key=lambda kv: (abs(kv[1] - target_n_res), kv[0]),
+        )
+        chain_order = [kv[0] for kv in best]
+    else:
+        chain_order = ["A", None]
+    for ch in chain_order:
+        if _mmcif_atom_site_ca_to_pdb(cif_path, ca_pdb, chain_preference=ch):
+            return ca_pdb
+    if _mmcif_atom_site_ca_to_pdb(cif_path, ca_pdb, chain_preference=None):
+        return ca_pdb
+    return None
 
 
 def ensure_experimental_ref(
     target: CASPTarget,
     cache_dir: str,
 ) -> Optional[str]:
-    """If target has a PDB code, fetch and return path to experimental PDB; else None."""
+    """If target has a PDB code, fetch coordinates (.pdb or mmCIF→Cα .pdb); else None."""
     if not target.pdb_code:
         return None
-    return fetch_experimental_pdb(target.pdb_code, cache_dir)
+    n = len(target.sequences[0]) if target.sequences else None
+    return fetch_experimental_pdb_or_mmcif(target.pdb_code, cache_dir, target_n_res=n)

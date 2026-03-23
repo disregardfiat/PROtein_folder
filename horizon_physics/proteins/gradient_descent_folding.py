@@ -1,9 +1,9 @@
 """
-Deterministic gradient-descent folding within HQIV.
+Gradient-based folding within HQIV.
 
-Pure first principles: E_tot = Σ ħc/Θ_i + U_φ (geometric damping). No Monte Carlo,
-no stochastic methods, no random seeds. Optimization is gradient-based only;
-L-BFGS (two-loop recursion) in pure numpy for deterministic convergence to minima.
+Core path: E_tot = Σ ħc/Θ_i + U_φ (geometric damping). ``minimize_e_tot_lbfgs`` is
+deterministic (no random seed). Optional ``thermal_gradient_relax_ca`` adds kT-scaled
+Gaussian noise on top of ``grad_full`` steps for finite-temperature exploration.
 Analytical gradients (grad_full) are used by default when energy is e_tot_ca_with_bonds;
 no finite differences for that path. Optional scipy.optimize.minimize(L-BFGS-B) if scipy available.
 
@@ -12,9 +12,10 @@ MIT License. Python 3.10+. Numpy (scipy optional for L-BFGS-B).
 
 from __future__ import annotations
 
+import functools
 import numpy as np
 from fractions import Fraction
-from typing import Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from .folding_energy import e_tot
 from .peptide_backbone import rational_ramachandran_alpha as _rational_ramachandran_alpha
@@ -143,8 +144,14 @@ def minimize_e_tot_lbfgs(
 
     ef = energy_func if energy_func is not None else e_tot
     _grad_func = grad_func
-    if _grad_func is None and getattr(ef, "__name__", None) == "e_tot_ca_with_bonds":
-        _grad_func = lambda pos, z: grad_full(pos, z, include_bonds=True, include_horizon=True, include_clash=True)
+    if _grad_func is None:
+        _is_e_ca = getattr(ef, "__name__", None) == "e_tot_ca_with_bonds"
+        if not _is_e_ca and isinstance(ef, functools.partial):
+            _is_e_ca = ef.func is e_tot_ca_with_bonds
+        if _is_e_ca:
+            _grad_func = lambda pos, z: grad_full(
+                pos, z, include_bonds=True, include_horizon=True, include_clash=True
+            )
 
     x = np.array(positions_init, dtype=float).ravel()
     n = len(z_list)
@@ -238,6 +245,61 @@ def minimize_e_tot_lbfgs(
         "n_iter": it + 1,
         "success": np.linalg.norm(grad) <= gtol,
         "message": "Converged" if np.linalg.norm(grad) <= gtol else "Max iterations",
+    }
+
+
+# k_B in eV/K (same convention as temperature_path_search.K_B_EV_K)
+_KB_EV_K = 8.617333262e-5
+
+
+def thermal_gradient_relax_ca(
+    positions_init: np.ndarray,
+    z_list: np.ndarray,
+    *,
+    n_steps: int = 80,
+    step_size: float = 0.025,
+    temperature_k: float = 310.0,
+    reference_temperature_k: float = 310.0,
+    noise_fraction: float = 0.2,
+    grad_full_extra_kwargs: Optional[Dict[str, Any]] = None,
+    r_bond_min: float = 2.5,
+    r_bond_max: float = 6.0,
+    seed: Optional[int] = None,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    Overdamped thermal walk on Cα: steepest descent in ``grad_full`` plus Gaussian noise
+    with RMS scaled by √(T/T_ref). Not a full Langevin integrator; useful to hop shallow
+    barriers after discrete refinement while staying in the same HQIV energy landscape.
+
+    ``noise_fraction`` multiplies ``step_size`` and √(T/T_ref) for the per-coordinate noise RMS (Å).
+    """
+    from .folding_energy import e_tot_ca_with_bonds, grad_full
+
+    rng = np.random.default_rng(seed)
+    kw = dict(grad_full_extra_kwargs or {})
+    kw.setdefault("include_bonds", True)
+    kw.setdefault("include_horizon", True)
+    kw.setdefault("include_clash", True)
+
+    pos = np.asarray(positions_init, dtype=float)
+    kT = _KB_EV_K * float(temperature_k)
+    kT0 = _KB_EV_K * float(reference_temperature_k)
+    t_ratio = max(kT / (kT0 + 1e-30), 1e-6)
+    noise_rms = float(noise_fraction * step_size * np.sqrt(t_ratio))
+
+    for _ in range(int(n_steps)):
+        g = grad_full(pos, z_list, **kw)
+        gn = float(np.linalg.norm(g)) + 1e-12
+        pos = pos - (step_size / gn) * g + rng.normal(0.0, noise_rms, pos.shape)
+        pos = _project_bonds(pos, r_min=r_bond_min, r_max=r_bond_max)
+
+    e_fin = float(e_tot_ca_with_bonds(pos, z_list))
+    return pos, {
+        "n_steps": int(n_steps),
+        "temperature_k": float(temperature_k),
+        "noise_rms": noise_rms,
+        "e_final": e_fin,
+        "message": "thermal_gradient_relax_ca",
     }
 
 

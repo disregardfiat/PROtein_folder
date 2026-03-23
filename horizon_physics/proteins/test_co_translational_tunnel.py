@@ -161,6 +161,43 @@ def test_co_translational_minimize_short_chain():
     assert "e_final" in info
 
 
+def test_co_translational_minimize_tunnel_thermal_counts_steps():
+    """Per-segment thermal relax runs after masked L-BFGS; stats aggregate total steps."""
+    from .folding_energy import grad_full
+    from .gradient_descent_folding import _project_bonds
+
+    seq = "MKF"
+    n = 3
+    ca_init = np.zeros((n, 3))
+    ca_init[:, 0] = np.arange(n) * 3.8
+    z_list = np.full(n, 6)
+    ptc = np.zeros(3)
+    axis = DEFAULT_TUNNEL_AXIS.copy()
+    ca_min, info = co_translational_minimize(
+        ca_init,
+        z_list,
+        ptc,
+        axis,
+        tunnel_length=25.0,
+        cone_half_angle_deg=12.0,
+        lip_plane_distance=0.0,
+        grad_func=lambda p, z: grad_full(
+            p, z, include_bonds=True, include_horizon=True, include_clash=True
+        ),
+        project_bonds=_project_bonds,
+        n_bell=2,
+        fast_pass_steps_per_connection=1,
+        min_pass_iter_per_connection=2,
+        tunnel_thermal_gradient_steps=4,
+        tunnel_thermal_temperature_k=310.0,
+        tunnel_thermal_seed=42,
+        tunnel_thermal_quick_cap=False,
+    )
+    assert ca_min.shape == (n, 3)
+    assert int(info.get("tunnel_thermal_total_steps", 0)) > 0
+    assert int(info.get("tunnel_thermal_segments", 0)) >= 1
+
+
 def test_minimize_full_chain_backward_compat():
     """Default simulate_ribosome_tunnel=False: behavior unchanged (no tunnel)."""
     from .full_protein_minimizer import minimize_full_chain
@@ -186,7 +223,13 @@ def test_minimize_full_chain_tunnel_mode():
     )
     assert result["n_res"] == 4
     assert result["ca_min"].shape == (4, 3)
-    assert "Co-translational" in result["info"].get("message", "") or "tunnel" in result["info"].get("message", "").lower()
+    msg = result["info"].get("message", "").lower()
+    assert (
+        "co-translational" in msg
+        or "tunnel" in msg
+        or "post-tunnel" in msg
+        or result["info"].get("post_extrusion_refine_mode") == "em_treetorque"
+    )
 
 
 def test_post_extrusion_refine():
@@ -202,7 +245,8 @@ def test_post_extrusion_refine():
         tunnel_length=25.0,
         cone_half_angle_deg=12.0,
     )
-    assert "post-extrusion" in result_refine["info"].get("message", "").lower()
+    msg_r = result_refine["info"].get("message", "").lower()
+    assert "post-extrusion" in msg_r or "post-tunnel" in msg_r or "tree-torque" in msg_r
     assert result_refine["ca_min"].shape == (4, 3)
 
     result_no_refine = minimize_full_chain(
@@ -214,7 +258,8 @@ def test_post_extrusion_refine():
         tunnel_length=25.0,
         cone_half_angle_deg=12.0,
     )
-    assert "Co-translational" in result_no_refine["info"].get("message", "") or "tunnel" in result_no_refine["info"].get("message", "").lower()
+    msg_nr = result_no_refine["info"].get("message", "").lower()
+    assert "co-translational" in msg_nr or "tunnel" in msg_nr
     assert result_no_refine["ca_min"].shape == (4, 3)
 
 
@@ -227,6 +272,7 @@ if __name__ == "__main__":
     test_bell_end_indices()
     test_align_chain_to_tunnel()
     test_co_translational_minimize_short_chain()
+    test_co_translational_minimize_tunnel_thermal_counts_steps()
     test_minimize_full_chain_backward_compat()
     test_minimize_full_chain_tunnel_mode()
     test_post_extrusion_refine()

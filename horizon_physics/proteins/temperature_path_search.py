@@ -1,8 +1,13 @@
 """
-Temperature-aware discrete DOF search: Metropolis moves over φ/ψ states with optional locking.
+Temperature-aware discrete DOF search over φ/ψ states with optional locking.
 
-Builds backbone DOFs, proposes moves from candidate_moves(), accepts/rejects with ΔE/kT,
-rebuilds Cα from φ/ψ and evaluates E_tot. Used to refine a backbone (e.g. after tunnel or Cartesian).
+- **Greedy (default):** pick the candidate with lowest ΔE; accept only if ΔE < 0 — effectively
+  T→0 descent on the discrete grid (can freeze in local minima).
+- **Metropolis (``use_metropolis=True``):** random candidate per step; accept with
+  ``min(1, exp(-ΔE/kT))`` at ``temperature`` K — thermal exploration consistent with ~300 K
+  folding (k_B in eV/K below).
+
+``maybe_lock`` always uses kT for barrier scaling regardless of move rule.
 """
 
 from __future__ import annotations
@@ -231,6 +236,7 @@ def run_discrete_refinement(
     barrier_factor: float = 5.0,
     n_states: int = 32,
     seed: Optional[int] = None,
+    use_metropolis: bool = False,
     run_until_converged: bool = False,
     max_phases_cap: int = 50,
     assembly_mode: bool = False,
@@ -245,7 +251,8 @@ def run_discrete_refinement(
        Else if initial_ca is provided, build backbone from _place_full_backbone(ca, seq) then extract φ/ψ.
        Else build initial CA via _place_backbone_ca(seq) and same.
     2) Build phi_dofs, psi_dofs; group = all DOFs.
-    3) For n_steps: get candidate_moves; pick one at random; Metropolis accept; rebuild ca, E_tot; every lock_every call maybe_lock(kT).
+    3) For n_steps: get candidate_moves; greedy (best ΔE, downhill only) or Metropolis
+       (random candidate, accept with exp(-ΔE/kT)); rebuild ca, E_tot; every lock_every call maybe_lock(kT).
     4) Return final ca, backbone_atoms, E_ca_final.
 
     Returns
@@ -261,6 +268,7 @@ def run_discrete_refinement(
 
     z_ca = _z_list_ca(seq)
     kT_ev = K_B_EV_K * temperature
+    rng = np.random.default_rng(seed)
 
     # Initial backbone and φ/ψ
     if initial_backbone_atoms is not None and len(initial_backbone_atoms) == 4 * n_res:
@@ -311,19 +319,35 @@ def run_discrete_refinement(
             moves = group.candidate_moves()
             if not moves:
                 break
-            # Deterministic choice: pick move with lowest ΔE (best local improvement)
-            dof_index, new_state_index, dE = min(moves, key=lambda m: m[2])
-            # Pure downhill dynamics on the discrete HQIV profile: only accept if ΔE < 0.
-            if dE < 0.0:
-                apply_move(dof_index, new_state_index)
-                phi_rad, psi_rad = angles_from_dofs(phi_dofs, psi_dofs)
-                ca = ca_positions_from_phi_psi(phi_rad, psi_rad)
-                E_current = float(e_tot_ca_with_bonds(ca, z_ca))
-                phase_accept += 1
-                total_accept += 1
+
+            if use_metropolis:
+                j = int(rng.integers(0, len(moves)))
+                dof_index, new_state_index, dE = moves[j]
+                accept = False
+                if dE <= 0.0:
+                    accept = True
+                elif kT_ev > 1e-25:
+                    arg = -float(dE) / kT_ev
+                    arg = max(min(arg, 60.0), -60.0)
+                    accept = float(rng.random()) < math.exp(arg)
+                if accept:
+                    apply_move(dof_index, new_state_index)
+                    phi_rad, psi_rad = angles_from_dofs(phi_dofs, psi_dofs)
+                    ca = ca_positions_from_phi_psi(phi_rad, psi_rad)
+                    E_current = float(e_tot_ca_with_bonds(ca, z_ca))
+                    phase_accept += 1
+                    total_accept += 1
             else:
-                # No downhill move available from current state: plateau for this phase.
-                break
+                dof_index, new_state_index, dE = min(moves, key=lambda m: m[2])
+                if dE < 0.0:
+                    apply_move(dof_index, new_state_index)
+                    phi_rad, psi_rad = angles_from_dofs(phi_dofs, psi_dofs)
+                    ca = ca_positions_from_phi_psi(phi_rad, psi_rad)
+                    E_current = float(e_tot_ca_with_bonds(ca, z_ca))
+                    phase_accept += 1
+                    total_accept += 1
+                else:
+                    break
             if (step + 1) % lock_every == 0:
                 for d in all_dofs:
                     d.maybe_lock(kT_ev, barrier_factor=barrier_factor)
@@ -378,5 +402,7 @@ def run_discrete_refinement(
             "lock_every": lock_every,
             "phases": phase_infos,
             "converged": converged,
+            "use_metropolis": use_metropolis,
+            "discrete_seed": seed,
         },
     )

@@ -1,15 +1,38 @@
 """
-CASP-compliant HTTP server: FASTA in → PDB out (full structure via HKE + funnel).
+CASP-compliant HTTP server: FASTA in → PDB out.
+
+**Default pipeline (Lean + ribosome tunnel):** HQIV Lean–aligned co-translational folding
+(`fold_lean_ribosome_tunnel`: bulk ε_r(T), pH screening, tunnel extrusion, then 3D EM-field relax
++ discrete tree-torque — not the legacy L-BFGS post-extrusion HKE unless `CASP_LEAN_POST_EXTRUSION_MODE=hke`).
+**Ligands:** single-chain folds include them in `fold_lean_ribosome_tunnel`; multi-chain jobs fold
+each chain with Lean, merge with chain offsets, then run the same 6-DOF ligand refinement vs the
+**full merged backbone** (screening-matched `em_scale`) and append HETATM. Fast-pass does the same
+with `quick=True` budgets.
+
+**Legacy pipeline:** Set `CASP_LEGACY_HKE_PIPELINE=1` to restore hierarchical HKE + funnel +
+optional tree-torque / extrude cycles.
+
 POST /predict with body = FASTA or form/JSON (sequence=, title=, email=).
-Uses minimize_full_chain_hierarchical with cone funnel (stages 1–2) then Cartesian refinement (stage 3).
 If "email" param is set and SMTP is configured, also sends PDB by email.
 GET /health → 200 OK.
-Env: SMTP_* for email; SMTP_CC_TO to CC when not recipient; CASP_OUTPUT_DIR (default ./casp_results) for pending/ and outputs/; USE_FAST_PREDICT=1 to skip HKE; PREDICTION_TIMEOUT_SEC (default 3600) to stop after 1h and send current PDB; CASP_MAX_CONCURRENT_JOBS (default 2) to cap parallel prediction subprocesses; CASP_KNOWN_TARGETS_CACHE (optional) dir to cache known targets and experimental PDBs from predictioncenter.org for equal footing; CASP_ROUND (default CASP16).
+
+Env: SMTP_* for email; SMTP_CC_TO to CC when not recipient; CASP_OUTPUT_DIR (default ./casp_results)
+for pending/ and outputs/; USE_FAST_PREDICT=1 to skip main pass (fast PDB only); PREDICTION_TIMEOUT_SEC
+(default 3600); CASP_MAX_CONCURRENT_JOBS (default 2); CASP_KNOWN_TARGETS_CACHE (optional) for known
+targets + experimental PDBs; CASP_ROUND (default CASP16); CASP_TARGET_ARCHIVE_ROOT (optional) for
+Sunday archival of the known-targets cache; CASP_DISABLE_SUNDAY_ARCHIVE=1 to skip.
+Thermal refinement (Lean post-tunnel): CASP_LEAN_DISCRETE_METROPOLIS=1 (Metropolis at temperature_k),
+CASP_LEAN_DISCRETE_SEED (optional int), CASP_LEAN_POST_ANNEAL=1 (short multi-K Metropolis cool-down vs single pass),
+CASP_LEAN_POST_ANNEAL_SCHEDULE=348,330,318,310 (optional comma-separated K, ≥2 values),
+CASP_LEAN_POST_LANGEVIN_STEPS, CASP_LEAN_LANGEVIN_NOISE_FRAC.
+In-tunnel thermal gradient: CASP_LEAN_TUNNEL_THERMAL_STEPS (default 0), CASP_LEAN_TUNNEL_THERMAL_NOISE_FRAC, CASP_LEAN_TUNNEL_THERMAL_SEED (optional).
+
 Run from repo root: gunicorn -w 1 -b 127.0.0.1:8050 casp_server:app
 """
 
 from __future__ import annotations
 
+import copy
 import io
 import json
 import math
@@ -44,7 +67,13 @@ from horizon_physics.proteins import (
     full_chain_to_pdb_complex,
     minimize_full_chain,
 )
+from horizon_physics.proteins.full_protein_minimizer import (
+    pdb_hetatm_lines_for_ligands,
+    refine_ligands_on_multichain_results,
+)
 from horizon_physics.proteins.ligands import parse_ligands
+from horizon_physics.proteins.hqiv_lean_folding import PHYSIOLOGICAL_PH
+from horizon_physics.proteins.lean_ribosome_tunnel_pipeline import fold_lean_ribosome_tunnel
 from horizon_physics.proteins.hierarchical import (
     minimize_full_chain_hierarchical,
     hierarchical_result_for_pdb,
@@ -118,6 +147,10 @@ DISABLE_PENDING_STARTUP = os.environ.get("CASP_DISABLE_PENDING_STARTUP", "").str
 # we match request sequences to known targets and fetch experimental refs so we're on equal footing.
 CASP_KNOWN_TARGETS_CACHE = (os.environ.get("CASP_KNOWN_TARGETS_CACHE") or "").strip() or None
 CASP_ROUND = os.environ.get("CASP_ROUND", "CASP16")
+# Default: Lean tunnel pipeline. Set CASP_LEGACY_HKE_PIPELINE=1 for hierarchical HKE + tree-torque stack.
+CASP_LEGACY_HKE_PIPELINE = os.environ.get("CASP_LEGACY_HKE_PIPELINE", "").strip().lower() in ("1", "true", "yes")
+CASP_TARGET_ARCHIVE_ROOT = (os.environ.get("CASP_TARGET_ARCHIVE_ROOT") or "").strip() or None
+CASP_DISABLE_SUNDAY_ARCHIVE = os.environ.get("CASP_DISABLE_SUNDAY_ARCHIVE", "").strip().lower() in ("1", "true", "yes")
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # 2 MB max FASTA
@@ -133,6 +166,164 @@ def _ensure_output_dirs() -> None:
     os.makedirs(OUTPUTS_DIR, exist_ok=True)
 
 
+def _use_lean_casp_pipeline() -> bool:
+    """True = default Lean ribosome-tunnel pipeline; False = CASP_LEGACY_HKE_PIPELINE."""
+    return not CASP_LEGACY_HKE_PIPELINE
+
+
+def _lean_fold_env_kwargs(quick: bool) -> dict:
+    """Environment-driven parameters for fold_lean_ribosome_tunnel (CASP tuning)."""
+    def _i(key: str, default: int) -> int:
+        return int(os.environ.get(key, str(default)))
+
+    def _f(key: str, default: float) -> float:
+        return float(os.environ.get(key, str(default)))
+
+    def _optional_i(key: str) -> int | None:
+        v = os.environ.get(key)
+        if v is None or str(v).strip() == "":
+            return None
+        return int(v)
+
+    ph_def = str(PHYSIOLOGICAL_PH)
+    post_mode = (os.environ.get("CASP_LEAN_POST_EXTRUSION_MODE") or "em_treetorque").strip().lower()
+    if post_mode not in ("none", "hke", "em_treetorque"):
+        post_mode = "em_treetorque"
+    disc_seed: int | None = None
+    _seed_s = os.environ.get("CASP_LEAN_DISCRETE_SEED", "").strip()
+    if _seed_s:
+        try:
+            disc_seed = int(_seed_s)
+        except ValueError:
+            disc_seed = None
+    if quick:
+        post_rounds = _i("CASP_LEAN_FAST_POST_EXTRUSION_MAX_ROUNDS", 12)
+        fpc = _i("CASP_LEAN_FAST_FAST_PASS_STEPS", 2)
+        mpc = _i("CASP_LEAN_FAST_MIN_PASS_ITER", 5)
+    else:
+        post_rounds = _i("CASP_LEAN_POST_EXTRUSION_MAX_ROUNDS", 32)
+        fpc = _i("CASP_LEAN_FAST_PASS_STEPS_PER_CONNECTION", 0)
+        mpc = _i("CASP_LEAN_MIN_PASS_ITER_PER_CONNECTION", 0)
+
+    def _comma_float_tuple(key: str) -> tuple[float, ...] | None:
+        raw = os.environ.get(key, "").strip()
+        if not raw:
+            return None
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        if len(parts) < 2:
+            return None
+        return tuple(float(p) for p in parts)
+
+    post_anneal = os.environ.get("CASP_LEAN_POST_ANNEAL", "").strip().lower() in ("1", "true", "yes")
+    anneal_sched = _comma_float_tuple("CASP_LEAN_POST_ANNEAL_SCHEDULE")
+
+    tunnel_th_seed: int | None = None
+    _tth_seed_s = os.environ.get("CASP_LEAN_TUNNEL_THERMAL_SEED", "").strip()
+    if _tth_seed_s:
+        try:
+            tunnel_th_seed = int(_tth_seed_s)
+        except ValueError:
+            tunnel_th_seed = None
+
+    return {
+        "temperature_k": _f("CASP_LEAN_TEMPERATURE_K", 310.0),
+        "ph": _f("CASP_LEAN_PH", float(ph_def)),
+        "kappa_dihedral": _f("CASP_LEAN_KAPPA_DIHEDRAL", 0.01),
+        "post_extrusion_refine_mode": post_mode,
+        "post_extrusion_em_max_steps": _optional_i("CASP_LEAN_POST_EM_MAX_STEPS"),
+        "post_extrusion_treetorque_phases": _i("CASP_LEAN_POST_TT_PHASES", 8),
+        "post_extrusion_treetorque_n_steps": _i("CASP_LEAN_POST_TT_N_STEPS", 200),
+        "post_extrusion_discrete_metropolis": os.environ.get("CASP_LEAN_DISCRETE_METROPOLIS", "")
+        .strip()
+        .lower()
+        in ("1", "true", "yes"),
+        "post_extrusion_discrete_seed": disc_seed,
+        "post_extrusion_anneal": post_anneal,
+        **({"post_extrusion_anneal_schedule_k": anneal_sched} if anneal_sched is not None else {}),
+        "tunnel_thermal_gradient_steps": _i("CASP_LEAN_TUNNEL_THERMAL_STEPS", 0),
+        "tunnel_thermal_noise_fraction": _f("CASP_LEAN_TUNNEL_THERMAL_NOISE_FRAC", 0.2),
+        **({"tunnel_thermal_seed": tunnel_th_seed} if tunnel_th_seed is not None else {}),
+        "post_extrusion_langevin_steps": _i("CASP_LEAN_POST_LANGEVIN_STEPS", 0),
+        "post_extrusion_langevin_noise_fraction": _f("CASP_LEAN_LANGEVIN_NOISE_FRAC", 0.2),
+        "post_extrusion_max_rounds": post_rounds,
+        "fast_pass_steps_per_connection": fpc,
+        "min_pass_iter_per_connection": mpc,
+        "hbond_weight": _f("CASP_LEAN_HBOND_WEIGHT", 0.0),
+        "hbond_shell_m": _i("CASP_LEAN_HBOND_SHELL_M", 3),
+        "ligand_refine_steps": _i("CASP_LEAN_LIGAND_REFINE_STEPS", 40),
+    }
+
+
+def _lean_grad_full_kwargs_for_ligand_refine(*, quick: bool) -> dict:
+    """EM screening for multichain ligand refinement (same bulk water + pH as fold_lean_ribosome_tunnel)."""
+    from horizon_physics.proteins.hqiv_lean_folding import (
+        em_scale_aqueous,
+        epsilon_r_water,
+        ph_em_scale_delta,
+    )
+
+    kw = _lean_fold_env_kwargs(quick)
+    t_k = float(kw["temperature_k"])
+    ph = float(kw["ph"])
+    er = epsilon_r_water(t_k)
+    em_scale = em_scale_aqueous(t_k, epsilon_r=er) * ph_em_scale_delta(ph)
+    return {"em_scale": float(em_scale), "hbond_weight": 0.0}
+
+
+def _maybe_archive_casp_targets_cache_on_sunday() -> None:
+    """
+    On each Sunday, move the contents of CASP_KNOWN_TARGETS_CACHE into
+    CASP_TARGET_ARCHIVE_ROOT (or ../archived_casp_targets under the cache parent)
+    so the next fetch pulls fresh targets from the prediction center.
+    """
+    global _known_casp_targets
+    if CASP_DISABLE_SUNDAY_ARCHIVE or not CASP_KNOWN_TARGETS_CACHE:
+        return
+    cache = CASP_KNOWN_TARGETS_CACHE
+    if not os.path.isdir(cache):
+        return
+    import datetime
+
+    if datetime.date.today().weekday() != 6:  # Sunday
+        return
+    today = datetime.date.today().isoformat()
+    marker = os.path.join(cache, ".sunday_archive_done")
+    try:
+        if os.path.isfile(marker):
+            with open(marker, encoding="utf-8") as f:
+                if f.read().strip() == today:
+                    return
+    except Exception:
+        pass
+    root = CASP_TARGET_ARCHIVE_ROOT or os.path.join(
+        os.path.dirname(os.path.abspath(cache)), "archived_casp_targets"
+    )
+    dest = os.path.join(root, f"{today}_targets")
+    try:
+        os.makedirs(dest, exist_ok=True)
+        moved_any = False
+        for name in os.listdir(cache):
+            if name.startswith(".sunday_archive"):
+                continue
+            src = os.path.join(cache, name)
+            dst = os.path.join(dest, name)
+            try:
+                shutil.move(src, dst)
+                moved_any = True
+            except Exception as e:
+                app.logger.warning("Sunday archive: could not move %s: %s", src, e)
+        if moved_any:
+            with open(marker, "w", encoding="utf-8") as f:
+                f.write(today)
+            _known_casp_targets = None
+            app.logger.info(
+                "Sunday archive: moved CASP targets cache to %s (fresh fetch on next use).",
+                dest,
+            )
+    except Exception as e:
+        app.logger.warning("Sunday archive failed: %s", e)
+
+
 # Lazy-loaded list of known CASP targets (when CASP_KNOWN_TARGETS_CACHE is set)
 _known_casp_targets: list | None = None
 
@@ -145,6 +336,7 @@ def _get_known_casp_targets() -> list:
     if not CASP_KNOWN_TARGETS_CACHE or fetch_known_targets is None:
         _known_casp_targets = []
         return _known_casp_targets
+    _maybe_archive_casp_targets_cache_on_sunday()
     try:
         _known_casp_targets = fetch_known_targets(
             casp_round=CASP_ROUND,
@@ -807,13 +999,33 @@ def _recover_completed_result(
     return True
 
 
-def _run_fast_pass(sequences: list[str], seqs: list[str]) -> str:
+def _run_fast_pass(
+    sequences: list[str],
+    seqs: list[str],
+    parsed_ligands: list | None = None,
+) -> str:
     """
-    Fast-pass prediction: lightweight hierarchical run (compact folds).
-    Uses funnel-constrained minimization with reduced iterations.
-    Avoids hqiv geometric placement (extended rods) and ensures chains are offset when merged.
+    Fast-pass prediction: quick Lean tunnel fold (default) or legacy hierarchical HKE.
+    Multichain + ligand: each chain folded with Lean, merged, ligands refined vs full complex.
     Returns a PDB string (single or multi-chain).
     """
+    if _use_lean_casp_pipeline():
+        if len(seqs) > 1:
+            return _predict_lean_assembly(
+                sequences, quick=True, parsed_ligands=parsed_ligands or None
+            )
+        use_lig = bool(parsed_ligands)
+        lig_chain = (os.environ.get("CASP_LIGAND_CHAIN_ID") or "L").strip() or None
+        out = fold_lean_ribosome_tunnel(
+            seqs[0],
+            quick=True,
+            include_ligands=use_lig,
+            ligands=parsed_ligands if use_lig else None,
+            ligand_chain_id=lig_chain if use_lig else None,
+            **_lean_fold_env_kwargs(quick=True),
+        )
+        _backbone_sanity_check(out.raw_result.get("backbone_atoms") or [], job_context="(lean fast-pass)")
+        return out.pdb
     if len(seqs) > 1:
         # Fold each chain quickly and merge without docking
         chain_ids = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -833,7 +1045,11 @@ def _run_fast_pass(sequences: list[str], seqs: list[str]) -> str:
             _backbone_sanity_check(result.get("backbone_atoms") or [], job_context="(HKE fast-pass)")
             cid = chain_ids[i] if i < len(chain_ids) else "A"
             results.append((result, cid))
-        return _merge_pdb_chains(results)
+        return _merge_pdb_chains(
+            results,
+            ligands=parsed_ligands or None,
+            ligand_refine_quick=True,
+        )
     # Single-chain quick hierarchical
     pos, z_list = minimize_full_chain_hierarchical(
         seqs[0],
@@ -847,6 +1063,12 @@ def _run_fast_pass(sequences: list[str], seqs: list[str]) -> str:
     )
     result = hierarchical_result_for_pdb(pos, z_list, seqs[0], include_sidechains=False)
     _backbone_sanity_check(result.get("backbone_atoms") or [], job_context="(HKE fast-pass)")
+    if parsed_ligands:
+        return _merge_pdb_chains(
+            [(result, "A")],
+            ligands=parsed_ligands,
+            ligand_refine_quick=True,
+        )
     return full_chain_to_pdb(result, chain_id="A")
 
 
@@ -857,12 +1079,13 @@ def _run_fast_pass_only(
     seqs: list[str],
     to_email: str | None,
     job_title: str | None,
+    parsed_ligands: list | None = None,
 ) -> None:
     """
     Run fast-pass only: write .fast.pdb, send first email. Does NOT increment attempts.
     Used by process_pending_jobs Phase 1 to give everyone a quick result. base = email__job_id or job_id for paths.
     """
-    fast_pdb = _run_fast_pass(sequences, seqs)
+    fast_pdb = _run_fast_pass(sequences, seqs, parsed_ligands=parsed_ligands)
     fast_path = os.path.join(PENDING_DIR, f"{base}.fast.pdb")
     with open(fast_path, "w") as f:
         f.write(fast_pdb)
@@ -883,7 +1106,7 @@ def _run_hke_only(
     Run HKE pipeline only. Assumes .fast.pdb exists in pending.
     On success: move to outputs, send second email (HKE + fast).
     On timeout (1h): write current PDB, send email with time-limit note, move to outputs, pick up next job.
-    On failure: raises (caller sends fast-pass so user gets at least some result).
+    On HKE failure: fall back to the already-generated fast-pass result so the requester still gets a model.
     """
     fast_path = os.path.join(PENDING_DIR, f"{base}.fast.pdb")
     with open(fast_path) as f:
@@ -891,41 +1114,110 @@ def _run_hke_only(
 
     # If USE_FAST_PREDICT, treat fast-pass as final (no HKE)
     if USE_FAST_PREDICT and hqiv_predict_structure is not None:
+        fast_pdb = _prepend_pdb_model_line(fast_pdb)
+        ok, reason = _pdb_sanity_check(fast_pdb)
+        if not ok:
+            raise ValueError(f"PDB sanity check failed (fast-pass): {reason}")
         _move_to_outputs(base, fast_pdb)
         try:
             shutil.move(fast_path, os.path.join(OUTPUTS_DIR, f"{base}.fast.pdb"))
         except Exception:
             pass
+        _write_models_record(
+            base,
+            job_id,
+            job_title,
+            to_email,
+            models=[
+                {"name": "Prediction1.pdb", "stage": "fast", "type": "fast", "file": f"{base}.pdb"},
+                {"name": "Prediction2.pdb", "stage": "fast", "type": "fast", "file": f"{base}.fast.pdb"},
+            ],
+            timed_out=False,
+        )
+        if to_email:
+            _send_pdb_email_multi(
+                to_email,
+                models=[
+                    ("Prediction1.pdb", fast_pdb),
+                    ("Prediction2.pdb", fast_pdb),
+                ],
+                title=job_title,
+            )
         return
 
     deadline = time.time() + PREDICTION_TIMEOUT_SEC
     timed_out = False
     hke_pdb = None
+    used_fast_fallback = False
+    fallback_reason = ""
 
-    # Full HKE pipeline (single or multi-chain)
-    if len(seqs) == 2:
-        assembly = None
-        try:
-            assembly = _predict_hke_assembly_with_complex(sequences)
-        except Exception as e:
-            app.logger.warning("HKE 2-chain failed, falling back to Cartesian: %s", e)
-            assembly = _predict_cartesian_assembly_with_complex(sequences)
-        if assembly is not None:
-            _pdb_a, _pdb_b, pdb_complex = assembly
-            hke_pdb = pdb_complex
+    # Full prediction pipeline: Lean tunnel (default) or legacy HKE / assembly
+    main_stage = "lean" if _use_lean_casp_pipeline() else "hke"
+    try:
+        if _use_lean_casp_pipeline():
+            if len(seqs) == 2 and os.environ.get("CASP_LEGACY_ASSEMBLY_DOCK", "").strip().lower() in ("1", "true", "yes"):
+                assembly = None
+                try:
+                    assembly = _predict_hke_assembly_with_complex(sequences)
+                except Exception as e:
+                    app.logger.warning("Legacy 2-chain assembly failed, falling back to Cartesian: %s", e)
+                    assembly = _predict_cartesian_assembly_with_complex(sequences)
+                if assembly is not None:
+                    _pdb_a, _pdb_b, pdb_complex = assembly
+                    hke_pdb = pdb_complex
+                else:
+                    hke_pdb = _predict_lean_assembly(
+                        sequences, quick=False, parsed_ligands=parsed_ligands or None
+                    )
+            elif len(seqs) >= 2:
+                hke_pdb = _predict_lean_assembly(
+                    sequences, quick=False, parsed_ligands=parsed_ligands or None
+                )
+            else:
+                hke_pdb, timed_out = _predict_lean_single_chain(
+                    seqs[0],
+                    parsed_ligands,
+                    deadline,
+                )
+                if timed_out and hke_pdb is None:
+                    hke_pdb = fast_pdb
+                    app.logger.info(
+                        "Job %s hit %ds timeout before Lean fold; sending fast-pass as result.",
+                        job_id,
+                        PREDICTION_TIMEOUT_SEC,
+                    )
+        elif len(seqs) == 2:
+            assembly = None
+            try:
+                assembly = _predict_hke_assembly_with_complex(sequences)
+            except Exception as e:
+                app.logger.warning("HKE 2-chain failed, falling back to Cartesian: %s", e)
+                assembly = _predict_cartesian_assembly_with_complex(sequences)
+            if assembly is not None:
+                _pdb_a, _pdb_b, pdb_complex = assembly
+                hke_pdb = pdb_complex
+            else:
+                hke_pdb = _predict_hke_assembly(seqs, parsed_ligands=parsed_ligands or None)
+        elif len(seqs) >= 3:
+            hke_pdb = _predict_hke_assembly_multichain(sequences, parsed_ligands=parsed_ligands or None)
         else:
-            hke_pdb = _predict_hke_assembly(seqs)
-    elif len(seqs) >= 3:
-        hke_pdb = _predict_hke_assembly_multichain(sequences)
-    else:
-        hke_pdb, timed_out = _predict_hke_single(
-            seqs[0],
-            ligands=parsed_ligands if parsed_ligands else None,
-            deadline_sec=deadline,
+            hke_pdb, timed_out = _predict_hke_single(
+                seqs[0],
+                ligands=parsed_ligands if parsed_ligands else None,
+                deadline_sec=deadline,
+            )
+            if timed_out and hke_pdb is None:
+                hke_pdb = fast_pdb
+                app.logger.info("Job %s hit %ds timeout before HKE; sending fast-pass as result.", job_id, PREDICTION_TIMEOUT_SEC)
+    except Exception as e:
+        used_fast_fallback = True
+        fallback_reason = str(e).strip()
+        hke_pdb = fast_pdb
+        app.logger.warning(
+            "Job %s full prediction pipeline failed; delivering fast-pass result instead: %s",
+            job_id,
+            fallback_reason or e,
         )
-        if timed_out and hke_pdb is None:
-            hke_pdb = fast_pdb
-            app.logger.info("Job %s hit %ds timeout before HKE; sending fast-pass as result.", job_id, PREDICTION_TIMEOUT_SEC)
 
     # Prepend submission model line and sanity-check before moving or sending
     hke_pdb = _prepend_pdb_model_line(hke_pdb)
@@ -960,21 +1252,38 @@ def _run_hke_only(
         job_id,
         job_title,
         to_email,
-        models=[
-            {
-                "name": "Prediction1.pdb",
-                "stage": "hke",
-                "type": "hke",
-                "file": f"{base}.pdb",
-            },
-            {
-                "name": "Prediction2.pdb",
-                "stage": "fast",
-                "type": "fast",
-                "file": f"{base}.fast.pdb",
-            },
-        ],
-        timed_out=False,
+        models=(
+            [
+                {
+                    "name": "Prediction1.pdb",
+                    "stage": "fast",
+                    "type": "fast",
+                    "file": f"{base}.pdb",
+                },
+                {
+                    "name": "Prediction2.pdb",
+                    "stage": "fast",
+                    "type": "fast",
+                    "file": f"{base}.fast.pdb",
+                },
+            ]
+            if used_fast_fallback
+            else [
+                {
+                    "name": "Prediction1.pdb",
+                    "stage": main_stage,
+                    "type": main_stage,
+                    "file": f"{base}.pdb",
+                },
+                {
+                    "name": "Prediction2.pdb",
+                    "stage": "fast",
+                    "type": "fast",
+                    "file": f"{base}.fast.pdb",
+                },
+            ]
+        ),
+        timed_out=timed_out,
     )
 
     # 3) Second email: HKE as Prediction1.pdb, fast-pass as Prediction2.pdb (to requester and CC)
@@ -985,6 +1294,13 @@ def _run_hke_only(
                 f"This prediction was stopped after the {PREDICTION_TIMEOUT_SEC // 3600}-hour time limit. "
                 "The attached model is the best structure obtained up to that point."
             )
+        elif used_fast_fallback:
+            body_extra = (
+                "The full main prediction (Lean tunnel or legacy HKE) did not complete successfully, "
+                "so the attached model is the fast-pass result."
+            )
+            if fallback_reason:
+                body_extra += f"\n\nRefinement error: {fallback_reason}"
         _send_pdb_email_multi(
             to_email,
             models=[
@@ -1030,7 +1346,9 @@ def _run_one_job_fast_then_hke(temp_path: str) -> None:
     parsed_ligands = parse_ligands(ligand_str) if ligand_str else []
     fast_path = os.path.join(PENDING_DIR, f"{base}.fast.pdb")
     if not os.path.isfile(fast_path):
-        _run_fast_pass_only(job_id, base, sequences, seqs, to_email, job_title)
+        _run_fast_pass_only(
+            job_id, base, sequences, seqs, to_email, job_title, parsed_ligands=parsed_ligands
+        )
     _run_hke_only(job_id, base, sequences, seqs, to_email, job_title, parsed_ligands)
 
 
@@ -1395,7 +1713,9 @@ def _run_full_job_pipelines(
     For a given job: run fast-pass first (send fast email), then full HKE pipeline.
     Used by _run_job_in_background for new POST jobs. base = email__job_id or job_id for paths.
     """
-    _run_fast_pass_only(job_id, base, sequences, seqs, to_email, job_title)
+    _run_fast_pass_only(
+        job_id, base, sequences, seqs, to_email, job_title, parsed_ligands=parsed_ligands
+    )
     _run_hke_only(job_id, base, sequences, seqs, to_email, job_title, parsed_ligands)
 
 
@@ -1517,6 +1837,100 @@ def _sequence_from_input(raw: str) -> str:
     return _parse_fasta(s) if ">" in s or "\n" in s else "".join(c for c in s.upper() if c.isalpha())
 
 
+def _predict_lean_assembly(
+    sequences: list[str],
+    *,
+    quick: bool,
+    parsed_ligands: list | None = None,
+) -> str:
+    """
+    Fold each chain with the Lean tunnel pipeline and merge (offset chains in +x).
+    Optional ligands: 6-DOF refinement vs full merged backbone, then HETATM (same screening as Lean fold).
+    """
+    chain_ids = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    results: list[tuple[dict, str]] = []
+    kw = _lean_fold_env_kwargs(quick)
+    for i, raw in enumerate(sequences):
+        seq = _sequence_from_input(raw)
+        if not seq:
+            continue
+        out = fold_lean_ribosome_tunnel(
+            seq,
+            quick=quick,
+            include_ligands=False,
+            **kw,
+        )
+        _backbone_sanity_check(out.raw_result.get("backbone_atoms") or [], job_context="(lean assembly)")
+        cid = chain_ids[i] if i < len(chain_ids) else "A"
+        results.append((out.raw_result, cid))
+    if not results:
+        return "MODEL     1\nENDMDL\nEND\n"
+    return _merge_pdb_chains(
+        results,
+        ligands=parsed_ligands or None,
+        ligand_refine_quick=quick,
+    )
+
+
+def _predict_lean_single_chain(
+    sequence: str,
+    parsed_ligands: list,
+    deadline_sec: float | None,
+) -> tuple[str | None, bool]:
+    """
+    Default single-chain CASP prediction: Lean ribosome tunnel + solvent/dihedral + optional ligands.
+    Returns (pdb_str, timed_out).
+    """
+    if deadline_sec is not None and time.time() >= deadline_sec:
+        return (None, True)
+    use_lig = bool(parsed_ligands)
+    lig_chain = (os.environ.get("CASP_LIGAND_CHAIN_ID") or "L").strip() or None
+    kw = _lean_fold_env_kwargs(quick=False)
+    out = fold_lean_ribosome_tunnel(
+        sequence,
+        quick=False,
+        include_ligands=use_lig,
+        ligands=parsed_ligands if use_lig else None,
+        ligand_chain_id=lig_chain if use_lig else None,
+        **kw,
+    )
+    _backbone_sanity_check(out.raw_result.get("backbone_atoms") or [], job_context="(lean tunnel)")
+    result = dict(out.raw_result)
+    seq = str(result.get("sequence") or sequence)
+    backbone = result.get("backbone_atoms")
+    post_mode = str(kw.get("post_extrusion_refine_mode") or "em_treetorque").strip().lower()
+    if (
+        run_discrete_refinement
+        and post_mode != "em_treetorque"
+        and os.environ.get("CASP_LEAN_TREE_TORQUE_AFTER", "").strip().lower() in ("1", "true", "yes")
+        and backbone
+        and len(backbone) == 4 * len(seq)
+    ):
+        try:
+            ref = run_discrete_refinement(
+                seq,
+                initial_backbone_atoms=list(backbone),
+                run_until_converged=True,
+                max_phases_cap=100000,
+            )
+            result = {
+                **result,
+                "backbone_atoms": ref.backbone_atoms,
+                "sequence": ref.sequence,
+                "n_res": ref.n_res,
+                "include_sidechains": False,
+            }
+        except Exception:
+            pass
+    pdb_str = full_chain_to_pdb(
+        result,
+        chain_id="A",
+        ligands=result.get("ligands"),
+        ligand_chain_id=lig_chain if use_lig else None,
+    )
+    return (pdb_str, False)
+
+
 def _predict_hke_single(
     sequence: str,
     ligands: list | None = None,
@@ -1610,10 +2024,19 @@ def _predict_hke_single(
     return (full_chain_to_pdb(result, chain_id="A"), False)
 
 
-def _merge_pdb_chains(result_and_chain_ids: list[tuple[dict, str]]) -> str:
-    """Merge multiple (result, chain_id) into one PDB (MODEL 1) with renumbered atom IDs. Offsets each chain along +x so they don't overlap."""
+def _merge_pdb_chains(
+    result_and_chain_ids: list[tuple[dict, str]],
+    *,
+    ligands: list | None = None,
+    ligand_chain_id: str | None = None,
+    ligand_refine_quick: bool = False,
+    ligand_refine_steps: int | None = None,
+) -> str:
+    """
+    Merge multiple (result, chain_id) into one PDB (MODEL 1) with renumbered atom IDs.
+    Offsets each chain along +x. Optional ligands: Lean-screened 6-DOF refinement vs merged backbone, then HETATM.
+    """
     from horizon_physics.proteins.casp_submission import AA_1to3
-    import numpy as np
     chain_gap = 50.0  # Å between chains
     # First pass: get min_x per chain for offset calculation
     chain_mins = []
@@ -1654,12 +2077,30 @@ def _merge_pdb_chains(result_and_chain_ids: list[tuple[dict, str]]) -> str:
                 atom_id += 1
                 idx += 1
         prev_max_x = chain_max_x
+    if ligands:
+        lcopy = copy.deepcopy(ligands)
+        if atom_id > 1:
+            kw_lean = _lean_fold_env_kwargs(quick=ligand_refine_quick)
+            steps = int(
+                ligand_refine_steps if ligand_refine_steps is not None else kw_lean["ligand_refine_steps"]
+            )
+            refine_ligands_on_multichain_results(
+                result_and_chain_ids,
+                lcopy,
+                grad_full_kwargs=_lean_grad_full_kwargs_for_ligand_refine(quick=ligand_refine_quick),
+                ligand_refine_steps=steps,
+            )
+        het_c = (ligand_chain_id or os.environ.get("CASP_LIGAND_CHAIN_ID") or "L").strip() or "L"
+        het_lines, atom_id = pdb_hetatm_lines_for_ligands(
+            lcopy, start_atom_id=atom_id, ligand_chain_id=het_c
+        )
+        lines.extend(het_lines)
     lines.append("ENDMDL")
     lines.append("END")
     return "\n".join(lines)
 
 
-def _predict_hke_assembly(sequences: list[str]) -> str:
+def _predict_hke_assembly(sequences: list[str], parsed_ligands: list | None = None) -> str:
     """Run HKE + funnel per chain; return one PDB with chain A, B, C, .... (no docking)."""
     chain_ids = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     results = []
@@ -1678,10 +2119,14 @@ def _predict_hke_assembly(sequences: list[str]) -> str:
         _backbone_sanity_check(result.get("backbone_atoms") or [], job_context="(HKE assembly)")
         cid = chain_ids[i] if i < len(chain_ids) else "A"
         results.append((result, cid))
-    return _merge_pdb_chains(results)
+    return _merge_pdb_chains(
+        results,
+        ligands=parsed_ligands or None,
+        ligand_refine_quick=False,
+    )
 
 
-def _predict_hke_assembly_multichain(sequences: list[str]) -> str:
+def _predict_hke_assembly_multichain(sequences: list[str], parsed_ligands: list | None = None) -> str:
     """
     Multi-chain with (A+B)+C docking: fold A, fold B, dock A+B; then fold C, dock (A+B)+C;
     repeat for further chains. Returns single PDB with chain A, B, C, ...
@@ -1692,7 +2137,9 @@ def _predict_hke_assembly_multichain(sequences: list[str]) -> str:
     if not seqs:
         return "MODEL     1\nENDMDL\nEND\n"
     if len(seqs) == 1:
-        pdb, _ = _predict_hke_single(seqs[0], ligands=None)
+        pdb, _ = _predict_hke_single(
+            seqs[0], ligands=parsed_ligands if parsed_ligands else None
+        )
         return pdb or "MODEL     1\nENDMDL\nEND\n"
     if len(seqs) == 2:
         # Prefer full EM-field assembly cycle (HKE + assembly-mode tree-torque + HKE + tree-torque)
@@ -1710,7 +2157,7 @@ def _predict_hke_assembly_multichain(sequences: list[str]) -> str:
         assembly = _predict_hke_assembly_with_complex(sequences)
         if assembly is not None:
             return assembly[2]
-        return _predict_hke_assembly(sequences)
+        return _predict_hke_assembly(sequences, parsed_ligands=parsed_ligands)
     # (A+B)+C pipeline: dock A+B (EM field, connection points), then tree-torque (further from COM first)
     result_a, result_b, result_ab = run_two_chain_assembly_hke(
         seqs[0],
@@ -1769,10 +2216,14 @@ def _predict_hke_assembly_multichain(sequences: list[str]) -> str:
         "sequence": seqs[-1],
         "n_res": chain_lengths[-1],
     })
-    return _merge_pdb_chains([
-        (results[j], chain_ids[j] if j < len(chain_ids) else "A")
-        for j in range(len(results))
-    ])
+    return _merge_pdb_chains(
+        [
+            (results[j], chain_ids[j] if j < len(chain_ids) else "A")
+            for j in range(len(results))
+        ],
+        ligands=parsed_ligands or None,
+        ligand_refine_quick=False,
+    )
 
 
 def _refine_assembly_chains_with_tree_torque(
@@ -2060,7 +2511,7 @@ Endpoints:
   GET  /help   — this message
   GET  /health — liveness
   GET  /status — list jobs: job_id, request (num_sequences, lengths, title; no email), status (pending/done/failed)
-  POST / or /predict — structure prediction (HKE + funnel + tree-torque)
+  POST / or /predict — structure prediction (Lean tunnel default; CASP_LEGACY_HKE_PIPELINE=1 for legacy)
 
 References:
   Repository:  {REPO_URL}
@@ -2071,15 +2522,22 @@ References:
 
 
 ALGORITHM_DESCRIPTION = r"""
-Prediction algorithm (tunnel + tree-torque refinement)
+Prediction algorithm (default: HQIV Lean ribosome tunnel + bulk solvent)
 
-1) Initial fold
-   Single chain: HKE (hierarchical kinetic expansion) with funnel constraint, or
-   minimize_full_chain when ligands are provided.
-   Assembly (A+B, (A+B)+C): fold each chain; model EM field of each compacted
-   protein; find most likely connection points; place and minimize the complex.
+1) Initial fold (default)
+   Single chain: co-translational ribosome tunnel with Lean-aligned ε_r(T), pH
+   screening, dihedral bias toward the HQIV α basin, post-extrusion refine; optional
+   ligands as 6-DOF rigid bodies (included in the tunnel fold for single chain).
+   Multi-chain: each chain folded the same way, merged with a chain–chain offset; ligands
+   (if provided) are refined against the **entire** merged complex backbone with the same
+   Lean bulk-water screening as the fold, then written as HETATM. No inter-chain docking
+   unless CASP_LEGACY_ASSEMBLY_DOCK=1.
 
-2) Tree-torque refinement (no end flag — run until no allowed moves)
+   Legacy mode (CASP_LEGACY_HKE_PIPELINE=1): hierarchical HKE + funnel; ligands use
+   minimize_full_chain; assembly docking as before.
+
+2) Optional tree-torque refinement (CASP_LEAN_TREE_TORQUE_AFTER=1 only)
+   When set, discrete φ/ψ refinement may run after the Lean backbone (no end flag — run until no allowed moves)
    All submissions and retries are piped through discrete φ/ψ refinement with
    EM-field-driven unfreezing until convergence (0 accepts in a phase and EM
    unfreeze cannot unlock any DOF).
@@ -2115,7 +2573,7 @@ def index():
     """GET: info and links. POST: same as /predict (submission URL)."""
     if request.method == "POST":
         return predict()
-    body = f"""HQIV CASP server — full structure (HKE + funnel + tree-torque)
+    body = f"""HQIV CASP server — Lean ribosome tunnel (default) + optional legacy HKE
 
   Repository:  {REPO_URL}
   pyhqiv:      {PYHQIV_URL}

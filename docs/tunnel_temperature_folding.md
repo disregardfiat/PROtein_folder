@@ -176,3 +176,13 @@ When **CASP_KNOWN_TARGETS_CACHE** is set to a directory path, the server:
 
 So we are on the same footing as other teams: we use the same experimental data from the Prediction Center, then run our **A+B assembly strategy** (or single-chain pipeline) as usual. The experimental ref in outputs allows direct comparison (e.g. with `grade_folds.ca_rmsd`) without manual lookup.
 
+---
+
+### 8. Post-tunnel short anneal and validation grading
+
+**Short Metropolis anneal (Lean post-extrusion, `em_treetorque` mode):** After 3D EM-field relaxation, you can replace the single discrete tree-torque pass with a **short cool-down** at several temperatures (high → `temperature_k`) using true Metropolis acceptance on the discrete moves. In Python this is `post_extrusion_anneal=True` on `fold_lean_ribosome_tunnel` / `minimize_full_chain`; optional `post_extrusion_anneal_schedule_k` is a tuple of Kelvin values (≥2). On the server, set `CASP_LEAN_POST_ANNEAL=1` and optionally `CASP_LEAN_POST_ANNEAL_SCHEDULE=348,330,318,310` (comma-separated). Any optional Langevin tail uses the **last** schedule temperature as its thermal scale.
+
+**Grading, not just timing:** `scripts/validate_casp_lean_pipeline.py` reports **wall time**, **PDB sanity**, and **scalar metrics** from the minimizer result (`E_ca_final`, `E_backbone_final`, Cα **Rg**). For structure quality vs an experiment or CASP model, pass **`--grade-ref path/to/ref.pdb`** or set **`VALIDATE_LEAN_REF_PDB`**; the script writes the prediction to a temp file and prints **Cα-RMSD** (Kabsch, order-aligned with trim to min length — use a reference that matches the folded sequence order). For full control (residue-ID alignment, chain selection), call `horizon_physics.proteins.grade_folds.ca_rmsd` directly.
+
+**In-tunnel thermal gradient (aligned with post-extrusion Langevin):** After each binary-tree segment’s masked L-BFGS pass, you can run **kT-scaled noisy gradient descent** on that segment using the **same** `grad_func` and **same** cone / lip / `hke_above_tunnel_fraction` masking as the L-BFGS step (`tunnel_thermal_gradient_relax_segment` in `co_translational_tunnel.py`). The thermal scale is **`refinement_temperature_k`** / body **`temperature_k`** on the Lean path. Python: `tunnel_thermal_gradient_steps` on `minimize_full_chain` / `fold_lean_ribosome_tunnel`. Server: **`CASP_LEAN_TUNNEL_THERMAL_STEPS`**, **`CASP_LEAN_TUNNEL_THERMAL_NOISE_FRAC`**, optional **`CASP_LEAN_TUNNEL_THERMAL_SEED`**. Default **0** preserves the old deterministic tunnel. **`quick=True`** caps per-segment thermal steps at **12** to bound cost.
+
