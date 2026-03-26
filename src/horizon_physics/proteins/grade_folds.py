@@ -12,7 +12,7 @@ Usage:
 from __future__ import annotations
 
 import sys
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -89,6 +89,88 @@ def load_ca_and_sequence_from_pdb(path: str) -> Tuple[np.ndarray, str]:
                 except (ValueError, IndexError):
                     continue
     return np.array(ca_xyz, dtype=np.float64), "".join(seq_list)
+
+
+ResidueKey = Tuple[str, int, str]
+
+
+def load_backbone_atoms_ordered_from_pdb(
+    path: str,
+    chain_id: Optional[str] = None,
+    *,
+    hetatm: bool = False,
+) -> List[Tuple[str, np.ndarray]]:
+    """
+    Load backbone atoms in **N, CA, C, O** order per residue (repeat for each residue).
+
+    Each residue must have N, CA, and C. If O is missing, O is placed at C (placeholder;
+    φ/ψ extraction uses only N, CA, C for dihedrals).
+
+    Parameters
+    ----------
+    path : str
+        PDB path.
+    chain_id : str or None
+        If set, only this chain (column 22).
+    hetatm : bool
+        If True, also read HETATM lines (default False: ATOM only).
+
+    Returns
+    -------
+    List of (atom_name, (x, y, z)) with 4 entries per residue in sequence order.
+    """
+    # (chain, resseq, icode) -> atom_name -> xyz
+    bucket: Dict[ResidueKey, Dict[str, np.ndarray]] = {}
+    with open(path) as f:
+        for line in f:
+            if not (line.startswith("ATOM ") or (hetatm and line.startswith("HETATM"))):
+                continue
+            try:
+                atom_name = line[12:16].strip().upper()
+                if atom_name not in ("N", "CA", "C", "O", "OXT"):
+                    continue
+                if atom_name == "OXT":
+                    continue
+                ch = line[21] if len(line) > 21 else " "
+                if chain_id is not None and ch.strip() != chain_id.strip():
+                    continue
+                resseq = int(line[22:26].strip())
+                icode = line[26].strip() if len(line) > 26 else ""
+                resname = line[17:20].strip().upper()
+                if resname in ("HOH", "WAT", "SOL"):
+                    continue
+                x = float(line[30:38])
+                y = float(line[38:46])
+                z = float(line[46:54])
+            except (ValueError, IndexError):
+                continue
+            key: ResidueKey = (ch, resseq, icode)
+            bucket.setdefault(key, {})
+            bucket[key][atom_name] = np.array([x, y, z], dtype=np.float64)
+
+    if not bucket:
+        raise ValueError("load_backbone_atoms_ordered_from_pdb: no matching backbone atoms.")
+
+    def _key_sort(k: ResidueKey) -> Tuple[str, int, str]:
+        return (k[0], k[1], k[2])
+
+    ordered_keys = sorted(bucket.keys(), key=_key_sort)
+    out: List[Tuple[str, np.ndarray]] = []
+    for key in ordered_keys:
+        atoms = bucket[key]
+        if "N" not in atoms or "CA" not in atoms or "C" not in atoms:
+            continue
+        n_xyz = atoms["N"]
+        ca_xyz = atoms["CA"]
+        c_xyz = atoms["C"]
+        o_xyz = atoms.get("O", c_xyz.copy())
+        out.append(("N", n_xyz))
+        out.append(("CA", ca_xyz))
+        out.append(("C", c_xyz))
+        out.append(("O", o_xyz))
+    if len(out) < 4:
+        raise ValueError("load_backbone_atoms_ordered_from_pdb: incomplete backbone.")
+    return out
 
 
 def kabsch_superpose(P: np.ndarray, Q: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:

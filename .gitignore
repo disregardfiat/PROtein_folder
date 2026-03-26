@@ -20,6 +20,7 @@ wheels/
 src/*.egg-info/
 .installed.cfg
 *.egg
+.casp*
 
 # Virtual envs and server config (real SMTP etc.)
 .env
@@ -30,6 +31,8 @@ src/*.egg-info/
 casp_results/
 env/
 venv/
+.protien_home
+HQIV_LEAN
 
 # IDE
 .idea/
@@ -40,3 +43,7 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local iterative tuning artifacts
+.casp_grade_outputs/iter_*/
+.casp_grade_outputs/*/iter_*/

@@ -20,6 +20,11 @@ from typing import Any, Callable, Dict, Optional, Tuple
 from .folding_energy import e_tot
 from .peptide_backbone import rational_ramachandran_alpha as _rational_ramachandran_alpha
 from . import alpha_helix as _alpha_helix
+from .force_carrier_ensemble import (
+    build_direction_set_6_axes,
+    choose_best_translation_direction,
+    maybe_refresh_em_field_direction_set,
+)
 
 EnergyFunc = Callable[[np.ndarray, np.ndarray], float]
 GradFunc = Callable[[np.ndarray, np.ndarray], np.ndarray]
@@ -126,6 +131,34 @@ def minimize_e_tot_lbfgs(
     r_bond_max: float = 6.0,
     use_scipy: bool = False,
     trajectory_callback: Optional[Callable[[int, np.ndarray], None]] = None,
+    ensemble_translation_mix_alpha: float = 0.0,
+    ensemble_translation_step: float = 0.35,
+    ensemble_decay_span: float = 0.25,
+    ensemble_beta: float = 0.35,
+    ensemble_s2_power: float = 1.0,
+    ensemble_score_lambda: float = 0.0,
+    ensemble_inertial_dt: float = 1.0,
+    ensemble_linear_damping: float = 0.9,
+    ensemble_linear_gain: float = 1.0,
+    ensemble_damping_mode: str = "linear",
+    ensemble_barrier_decay: float = 0.95,
+    ensemble_barrier_build: float = 0.05,
+    ensemble_barrier_relief: float = 0.25,
+    ensemble_target_transition_only: bool = False,
+    ensemble_target_mix_alpha: float = 0.03,
+    ensemble_target_mix_tolerance: float = 1e-9,
+    ensemble_angular_mix_alpha: float = 0.0,
+    ensemble_angular_damping: float = 0.9,
+    ensemble_angular_gain: float = 0.2,
+    ensemble_direction_set: Optional[np.ndarray] = None,
+    ensemble_large_translation_trigger: float = 0.35,
+    ensemble_em_refresh_after_trigger: bool = True,
+    ensemble_em_max_extra_directions: int = 24,
+    ensemble_em_refresh_on_horizon_crossing: bool = True,
+    ensemble_em_refresh_on_horizon_leaving: bool = False,
+    ensemble_em_refresh_horizon_ang: float = 15.0,
+    ensemble_em_refresh_min_seq_sep: int = 3,
+    ensemble_em_refresh_on_large_disp: bool = False,
 ) -> Tuple[np.ndarray, Dict[str, float]]:
     """
     Minimize E using L-BFGS (deterministic). No random seed; same initial
@@ -204,7 +237,21 @@ def minimize_e_tot_lbfgs(
     grad = _grad(x)
     s_list: list[np.ndarray] = []
     y_list: list[np.ndarray] = []
+    direction_set = ensemble_direction_set
+    if direction_set is None:
+        direction_set = build_direction_set_6_axes()
+    direction_set_active = np.asarray(direction_set, dtype=float)
+    a = float(ensemble_translation_mix_alpha)
+    use_target_inertial = (not bool(ensemble_target_transition_only)) or (
+        abs(a - float(ensemble_target_mix_alpha)) <= float(ensemble_target_mix_tolerance)
+    )
+    linear_momentum_state = np.zeros((n, 3), dtype=float)
+    barrier_budget_state = np.zeros((n,), dtype=float)
+    resonance_state = 0.0
+    omega_state = np.zeros(3, dtype=float)
     for it in range(max_iter):
+        grad_mat_start = grad.reshape(n, 3).copy()
+        disp_best = None
         g_norm = np.linalg.norm(grad)
         if g_norm <= gtol:
             break
@@ -215,6 +262,48 @@ def minimize_e_tot_lbfgs(
             direction = -grad
         else:
             direction = _lbfgs_two_loop(grad, s_list, y_list, m)
+        if a > 0.0:
+            grad_mat = grad.reshape(n, 3)
+            sel = choose_best_translation_direction(
+                grad=grad_mat,
+                positions=x.reshape(n, 3),
+                step=ensemble_translation_step,
+                span=ensemble_decay_span,
+                p=ensemble_s2_power,
+                beta=ensemble_beta,
+                score_lambda=ensemble_score_lambda,
+                direction_set=direction_set_active,
+                sources=(0, -1),
+                residue_masses=z_list,
+                left_anchor_infinite=False,
+                linear_momentum_state=linear_momentum_state,
+                barrier_budget_state=barrier_budget_state,
+                inertial_dt=ensemble_inertial_dt if use_target_inertial else 1.0,
+                linear_damping=ensemble_linear_damping if use_target_inertial else 0.0,
+                linear_gain=ensemble_linear_gain if use_target_inertial else 1.0,
+                damping_mode=ensemble_damping_mode if use_target_inertial else "linear",
+                barrier_decay=ensemble_barrier_decay if use_target_inertial else 1.0,
+                barrier_build=ensemble_barrier_build if use_target_inertial else 0.0,
+                barrier_relief=ensemble_barrier_relief if use_target_inertial else 0.0,
+                resonance_state=resonance_state,
+                omega_state=omega_state,
+                angular_mix=ensemble_angular_mix_alpha if use_target_inertial else 0.0,
+                angular_damping=ensemble_angular_damping if use_target_inertial else 0.0,
+                angular_gain=ensemble_angular_gain if use_target_inertial else 0.0,
+            )
+            disp_best = np.asarray(sel["best_disp"], dtype=float).ravel()
+            linear_momentum_state = np.asarray(
+                sel.get("best_linear_momentum_state", linear_momentum_state), dtype=float
+            ).reshape(n, 3)
+            barrier_budget_state = np.asarray(
+                sel.get("best_barrier_budget_state", barrier_budget_state), dtype=float
+            ).reshape(n,)
+            resonance_state = float(sel.get("best_resonance_state", resonance_state))
+            omega_state = np.asarray(sel.get("best_omega_state", omega_state), dtype=float).reshape(3,)
+            n_disp = float(np.linalg.norm(disp_best)) + 1e-14
+            n_dir = float(np.linalg.norm(direction)) + 1e-14
+            disp_scaled = disp_best * (n_dir / n_disp)
+            direction = (1.0 - a) * direction + a * disp_scaled
         # Deterministic line search: backtrack until sufficient decrease
         step = 1.0
         e_curr = ef(x.reshape(n, 3), z_list)
@@ -231,6 +320,22 @@ def minimize_e_tot_lbfgs(
             step *= 0.5
         x_prev = x.copy()
         x = x_new
+        if a > 0.0 and bool(ensemble_em_refresh_after_trigger):
+            direction_set_active, _, _, _ = maybe_refresh_em_field_direction_set(
+                x_prev.reshape(n, 3),
+                x.reshape(n, 3),
+                grad_mat_start,
+                direction_set,
+                direction_set_active,
+                disp_best,
+                refresh_on_horizon_crossing=bool(ensemble_em_refresh_on_horizon_crossing),
+                refresh_on_horizon_leaving=bool(ensemble_em_refresh_on_horizon_leaving),
+                horizon_ang=float(ensemble_em_refresh_horizon_ang),
+                min_seq_sep=int(ensemble_em_refresh_min_seq_sep),
+                refresh_on_large_disp=bool(ensemble_em_refresh_on_large_disp),
+                large_disp_thresh=float(ensemble_large_translation_trigger),
+                max_extra_vectors=int(ensemble_em_max_extra_directions),
+            )
         if trajectory_callback is not None:
             trajectory_callback(it + 1, x.reshape(n, 3))
         grad_new = _grad(x)

@@ -16,6 +16,12 @@ from __future__ import annotations
 import numpy as np
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from .force_carrier_ensemble import (
+    build_direction_set_6_axes,
+    choose_best_translation_direction,
+    maybe_refresh_em_field_direction_set,
+)
+
 # Cα+bonds+clash energy for line search / reporting (default ``e_tot_ca_with_bonds``).
 EnergyFuncCA = Callable[[np.ndarray, np.ndarray], float]
 
@@ -119,6 +125,82 @@ def plane_lip_null_backward_gradient(
         ax_comp = np.dot(grad[i], axis)
         if ax_comp < 0:
             grad[i] -= ax_comp * axis
+
+
+def cone_constraint_mask_displacement(
+    disp: np.ndarray,
+    positions: np.ndarray,
+    ptc_origin: np.ndarray,
+    axis: np.ndarray,
+    cone_half_angle_deg: float,
+    tunnel_length: float,
+) -> None:
+    """
+    In-place: zero the outward radial component of displacement when a Cα
+    is already at/near the cone boundary.
+    """
+    axis = _normalize_axis(axis)
+    half_angle_rad = np.deg2rad(cone_half_angle_deg)
+    tan_alpha = np.tan(half_angle_rad)
+    n = positions.shape[0]
+    for i in range(n):
+        v = positions[i] - ptc_origin
+        s = float(np.dot(v, axis))
+        if s < -1e-9 or s > tunnel_length + 1e-9:
+            continue
+        r_parallel = s * axis
+        r_perp_vec = v - r_parallel
+        r_perp = np.linalg.norm(r_perp_vec)
+        r_max = max(s, 1e-9) * tan_alpha
+        if r_perp < 1e-12:
+            continue
+        radial_unit = r_perp_vec / r_perp
+        if r_perp >= r_max - 1e-9:
+            # Remove outward radial component of displacement.
+            out_comp = float(np.dot(disp[i], radial_unit))
+            if out_comp > 0.0:
+                disp[i] -= out_comp * radial_unit
+
+
+def plane_lip_null_backward_displacement(
+    disp: np.ndarray,
+    positions: np.ndarray,
+    ptc_origin: np.ndarray,
+    axis: np.ndarray,
+    lip_distance: float,
+) -> None:
+    """
+    In-place: remove displacement components that would move residues back
+    across the lip plane.
+    """
+    axis = _normalize_axis(axis)
+    s = (positions - ptc_origin) @ axis
+    n = positions.shape[0]
+    for i in range(n):
+        if s[i] <= lip_distance + 1e-9:
+            continue
+        ax_comp = float(np.dot(disp[i], axis))
+        if ax_comp < 0.0:
+            disp[i] -= ax_comp * axis
+
+
+def apply_cone_and_plane_masking_on_displacement(
+    disp: np.ndarray,
+    positions: np.ndarray,
+    ptc_origin: np.ndarray,
+    axis: np.ndarray,
+    tunnel_length: float,
+    cone_half_angle_deg: float,
+    lip_plane_distance: float = 0.0,
+) -> None:
+    """
+    Apply cone + lip constraints to a displacement field (in-place).
+    """
+    cone_constraint_mask_displacement(
+        disp, positions, ptc_origin, axis, cone_half_angle_deg, tunnel_length
+    )
+    lip_distance = tunnel_length + lip_plane_distance
+    plane_lip_null_backward_displacement(disp, positions, ptc_origin, axis, lip_distance)
 
 
 def apply_cone_and_plane_masking(
@@ -236,6 +318,33 @@ def run_masked_lbfgs_pass(
     r_bond_max: float = 6.0,
     hke_above_tunnel_fraction: Optional[float] = 0.5,
     energy_func_ca: Optional[EnergyFuncCA] = None,
+    ensemble_translation_mix_alpha: float = 0.0,
+    ensemble_translation_step: float = 0.35,
+    ensemble_decay_span: float = 0.25,
+    ensemble_beta: float = 0.35,
+    ensemble_s2_power: float = 1.0,
+    ensemble_score_lambda: float = 0.0,
+    ensemble_inertial_dt: float = 1.0,
+    ensemble_linear_damping: float = 0.9,
+    ensemble_linear_gain: float = 1.0,
+    ensemble_damping_mode: str = "linear",
+    ensemble_barrier_decay: float = 0.95,
+    ensemble_barrier_build: float = 0.05,
+    ensemble_barrier_relief: float = 0.25,
+    ensemble_target_transition_only: bool = False,
+    ensemble_target_mix_alpha: float = 0.03,
+    ensemble_target_mix_tolerance: float = 1e-9,
+    ensemble_angular_mix_alpha: float = 0.0,
+    ensemble_angular_damping: float = 0.9,
+    ensemble_angular_gain: float = 0.2,
+    ensemble_direction_set: Optional[np.ndarray] = None,
+    ensemble_em_refresh_on_horizon_crossing: bool = True,
+    ensemble_em_refresh_on_horizon_leaving: bool = False,
+    ensemble_em_refresh_horizon_ang: float = 15.0,
+    ensemble_em_refresh_min_seq_sep: int = 3,
+    ensemble_em_refresh_on_large_disp: bool = False,
+    ensemble_em_refresh_large_disp_thresh: float = 0.35,
+    ensemble_em_max_extra_directions: int = 24,
 ) -> Tuple[np.ndarray, int]:
     """
     Run one short HKE (L-BFGS) minimization pass with cone and plane gradient
@@ -255,6 +364,18 @@ def run_masked_lbfgs_pass(
     x = pos.ravel()
     lip_distance = tunnel_length + lip_plane_distance
     use_hke_fraction = hke_above_tunnel_fraction is not None
+    direction_set = ensemble_direction_set
+    if direction_set is None:
+        direction_set = build_direction_set_6_axes()
+    direction_set_active = np.asarray(direction_set, dtype=float)
+    a = float(ensemble_translation_mix_alpha)
+    use_target_inertial = (not bool(ensemble_target_transition_only)) or (
+        abs(a - float(ensemble_target_mix_alpha)) <= float(ensemble_target_mix_tolerance)
+    )
+    linear_momentum_state = np.zeros((n, 3), dtype=float)
+    barrier_budget_state = np.zeros((n,), dtype=float)
+    resonance_state = 0.0
+    omega_state = np.zeros(3, dtype=float)
 
     def _grad_raw(x_flat: np.ndarray) -> np.ndarray:
         p = x_flat.reshape(n, 3)
@@ -274,6 +395,9 @@ def run_masked_lbfgs_pass(
     gtol = 1e-5
     grad = _grad_raw(x)
     for it in range(max_iter):
+        pos = x.reshape(n, 3).copy()
+        disp_best = None
+        grad_mat = grad.reshape(n, 3)
         g_norm = np.linalg.norm(grad)
         if g_norm <= gtol:
             return x.reshape(n, 3).copy(), it
@@ -284,6 +408,57 @@ def run_masked_lbfgs_pass(
             direction = -grad
         else:
             direction = _lbfgs_two_loop(grad, s_list, y_list, m)
+        if a > 0.0:
+            sel = choose_best_translation_direction(
+                grad=grad_mat,
+                positions=pos,
+                step=ensemble_translation_step,
+                span=ensemble_decay_span,
+                p=ensemble_s2_power,
+                beta=ensemble_beta,
+                score_lambda=ensemble_score_lambda,
+                direction_set=direction_set_active,
+                sources=(0, -1),
+                residue_masses=z_list,
+                left_anchor_infinite=True,
+                linear_momentum_state=linear_momentum_state,
+                barrier_budget_state=barrier_budget_state,
+                inertial_dt=ensemble_inertial_dt if use_target_inertial else 1.0,
+                linear_damping=ensemble_linear_damping if use_target_inertial else 0.0,
+                linear_gain=ensemble_linear_gain if use_target_inertial else 1.0,
+                damping_mode=ensemble_damping_mode if use_target_inertial else "linear",
+                barrier_decay=ensemble_barrier_decay if use_target_inertial else 1.0,
+                barrier_build=ensemble_barrier_build if use_target_inertial else 0.0,
+                barrier_relief=ensemble_barrier_relief if use_target_inertial else 0.0,
+                resonance_state=resonance_state,
+                omega_state=omega_state,
+                angular_mix=ensemble_angular_mix_alpha if use_target_inertial else 0.0,
+                angular_damping=ensemble_angular_damping if use_target_inertial else 0.0,
+                angular_gain=ensemble_angular_gain if use_target_inertial else 0.0,
+            )
+            disp_best = np.asarray(sel["best_disp"], dtype=float)
+            linear_momentum_state = np.asarray(
+                sel.get("best_linear_momentum_state", linear_momentum_state), dtype=float
+            ).reshape(n, 3)
+            barrier_budget_state = np.asarray(
+                sel.get("best_barrier_budget_state", barrier_budget_state), dtype=float
+            ).reshape(n,)
+            resonance_state = float(sel.get("best_resonance_state", resonance_state))
+            omega_state = np.asarray(sel.get("best_omega_state", omega_state), dtype=float).reshape(3,)
+            apply_cone_and_plane_masking_on_displacement(
+                disp_best,
+                pos,
+                ptc_origin,
+                axis,
+                tunnel_length,
+                cone_half_angle_deg,
+                lip_plane_distance,
+            )
+            disp_best_flat = disp_best.ravel()
+            n_disp = float(np.linalg.norm(disp_best_flat)) + 1e-14
+            n_dir = float(np.linalg.norm(direction)) + 1e-14
+            disp_scaled = disp_best_flat * (n_dir / n_disp)
+            direction = (1.0 - a) * direction + a * disp_scaled
         step = 1.0
         e_curr = _e_ca(x.reshape(n, 3), z_list)
         c1 = 1e-4
@@ -299,6 +474,22 @@ def run_masked_lbfgs_pass(
             step *= 0.5
         x_prev = x.copy()
         x = x_new
+        if a > 0.0:
+            direction_set_active, _, _, _ = maybe_refresh_em_field_direction_set(
+                x_prev.reshape(n, 3),
+                x.reshape(n, 3),
+                grad_mat,
+                direction_set,
+                direction_set_active,
+                disp_best,
+                refresh_on_horizon_crossing=bool(ensemble_em_refresh_on_horizon_crossing),
+                refresh_on_horizon_leaving=bool(ensemble_em_refresh_on_horizon_leaving),
+                horizon_ang=float(ensemble_em_refresh_horizon_ang),
+                min_seq_sep=int(ensemble_em_refresh_min_seq_sep),
+                refresh_on_large_disp=bool(ensemble_em_refresh_on_large_disp),
+                large_disp_thresh=float(ensemble_em_refresh_large_disp_thresh),
+                max_extra_vectors=int(ensemble_em_max_extra_directions),
+            )
         grad_new = _grad_raw(x)
         s_list.append(x - x_prev)
         y_list.append(grad_new - grad)
@@ -362,6 +553,133 @@ def tunnel_thermal_gradient_relax_segment(
         "noise_rms": noise_rms,
         "e_final": e_fin,
         "message": "tunnel_thermal_gradient_relax_segment",
+    }
+
+
+def _handedness_energy_window(
+    positions: np.ndarray,
+    axis: np.ndarray,
+    *,
+    start_idx: int,
+    end_idx: int,
+    sign: float,
+    target: float,
+) -> float:
+    """Local chirality proxy energy on [start_idx, end_idx) residues."""
+    n = int(positions.shape[0])
+    s = max(0, int(start_idx))
+    e = min(n, int(end_idx))
+    if e - s < 3:
+        return 0.0
+    ax = _normalize_axis(axis)
+    sgn = 1.0 if float(sign) >= 0.0 else -1.0
+    tgt = float(target)
+    e_tot = 0.0
+    for i in range(s + 2, e):
+        t1 = positions[i - 1] - positions[i - 2]
+        t2 = positions[i] - positions[i - 1]
+        n1 = float(np.linalg.norm(t1))
+        n2 = float(np.linalg.norm(t2))
+        if n1 < 1e-12 or n2 < 1e-12:
+            continue
+        chi = float(np.dot(ax, np.cross(t1 / n1, t2 / n2)))
+        d = sgn * chi - tgt
+        e_tot += d * d
+    return float(e_tot)
+
+
+def _handedness_grad_fd_window(
+    positions: np.ndarray,
+    axis: np.ndarray,
+    *,
+    start_idx: int,
+    end_idx: int,
+    sign: float,
+    target: float,
+    eps: float = 1e-3,
+) -> np.ndarray:
+    """Finite-difference handedness gradient, restricted to window residues."""
+    pos = np.asarray(positions, dtype=float)
+    g = np.zeros_like(pos)
+    n = int(pos.shape[0])
+    s = max(0, int(start_idx))
+    e = min(n, int(end_idx))
+    if e - s < 3:
+        return g
+    for i in range(s, e):
+        for d in range(3):
+            pp = pos.copy()
+            pm = pos.copy()
+            pp[i, d] += eps
+            pm[i, d] -= eps
+            ep = _handedness_energy_window(
+                pp, axis, start_idx=s, end_idx=e, sign=sign, target=target
+            )
+            em = _handedness_energy_window(
+                pm, axis, start_idx=s, end_idx=e, sign=sign, target=target
+            )
+            g[i, d] = (ep - em) / (2.0 * eps)
+    return g
+
+
+def tunnel_free_terminus_handedness_relax(
+    positions: np.ndarray,
+    z_list: np.ndarray,
+    ptc_origin: np.ndarray,
+    axis: np.ndarray,
+    tunnel_length: float,
+    cone_half_angle_deg: float,
+    lip_plane_distance: float,
+    grad_func,
+    project_bonds,
+    *,
+    n_steps: int,
+    window_size: int,
+    handedness_weight: float,
+    handedness_target: float,
+    handedness_sign: float,
+    step_size: float,
+    r_bond_min: float,
+    r_bond_max: float,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    After full extrusion is available, take explicit tunnel-constrained steps on the
+    free C-terminus window under local EM gradient plus chirality bias.
+    """
+    pos = np.asarray(positions, dtype=float).copy()
+    n = int(pos.shape[0])
+    if n <= 2 or int(n_steps) <= 0:
+        return pos, {"n_steps": 0, "message": "tunnel_free_terminus_handedness_relax: skipped"}
+    w = max(3, min(int(window_size), n))
+    s = n - w
+    k_hand = max(0.0, float(handedness_weight))
+    for _ in range(int(n_steps)):
+        g = grad_func(pos, z_list)
+        if k_hand > 0.0:
+            g = g + k_hand * _handedness_grad_fd_window(
+                pos,
+                axis,
+                start_idx=s,
+                end_idx=n,
+                sign=float(handedness_sign),
+                target=float(handedness_target),
+            )
+        apply_cone_and_plane_masking(
+            g, pos, ptc_origin, axis, tunnel_length, cone_half_angle_deg, lip_plane_distance
+        )
+        # Only free terminus window advances in this explicit phase.
+        if s > 0:
+            g[:s, :] = 0.0
+        gn = float(np.linalg.norm(g)) + 1e-12
+        pos = pos - (float(step_size) / gn) * g
+        pos = project_bonds(pos, r_min=r_bond_min, r_max=r_bond_max)
+    return pos, {
+        "n_steps": int(n_steps),
+        "window_size": int(w),
+        "handedness_weight": float(k_hand),
+        "handedness_target": float(handedness_target),
+        "handedness_sign": float(handedness_sign),
+        "message": "tunnel_free_terminus_handedness_relax",
     }
 
 
@@ -443,6 +761,33 @@ def _segment_pass(
     tunnel_thermal_rng: Optional[np.random.Generator],
     tunnel_thermal_stats: Optional[Dict[str, Any]],
     energy_func_ca: Optional[EnergyFuncCA],
+    ensemble_translation_mix_alpha: float = 0.0,
+    ensemble_translation_step: float = 0.35,
+    ensemble_decay_span: float = 0.25,
+    ensemble_beta: float = 0.35,
+    ensemble_s2_power: float = 1.0,
+    ensemble_score_lambda: float = 0.0,
+    ensemble_inertial_dt: float = 1.0,
+    ensemble_linear_damping: float = 0.9,
+    ensemble_linear_gain: float = 1.0,
+    ensemble_damping_mode: str = "linear",
+    ensemble_barrier_decay: float = 0.95,
+    ensemble_barrier_build: float = 0.05,
+    ensemble_barrier_relief: float = 0.25,
+    ensemble_target_transition_only: bool = False,
+    ensemble_target_mix_alpha: float = 0.03,
+    ensemble_target_mix_tolerance: float = 1e-9,
+    ensemble_angular_mix_alpha: float = 0.0,
+    ensemble_angular_damping: float = 0.9,
+    ensemble_angular_gain: float = 0.2,
+    ensemble_direction_set: Optional[np.ndarray] = None,
+    ensemble_em_refresh_on_horizon_crossing: bool = True,
+    ensemble_em_refresh_on_horizon_leaving: bool = False,
+    ensemble_em_refresh_horizon_ang: float = 15.0,
+    ensemble_em_refresh_min_seq_sep: int = 3,
+    ensemble_em_refresh_on_large_disp: bool = False,
+    ensemble_em_refresh_large_disp_thresh: float = 0.35,
+    ensemble_em_max_extra_directions: int = 24,
 ) -> int:
     """Run one fast-pass + min pass on segment pos[i:j]. Bell = junction (or both if L==2). Returns n_iter."""
     L = j - i
@@ -456,8 +801,22 @@ def _segment_pass(
     else:
         bell_seg = [mid_seg - 1, mid_seg]
     rigid_seg = [idx for idx in range(L) if idx not in bell_seg]
+    direction_set = ensemble_direction_set
+    if direction_set is None:
+        direction_set = build_direction_set_6_axes()
+    direction_set_active = np.asarray(direction_set, dtype=float)
+    a = float(ensemble_translation_mix_alpha)
+    use_target_inertial = (not bool(ensemble_target_transition_only)) or (
+        abs(a - float(ensemble_target_mix_alpha)) <= float(ensemble_target_mix_tolerance)
+    )
+    linear_momentum_state = np.zeros((L, 3), dtype=float)
+    barrier_budget_state = np.zeros((L,), dtype=float)
+    resonance_state = 0.0
+    omega_state = np.zeros(3, dtype=float)
 
     for _ in range(fast_pass_steps_per_connection):
+        pos_full_before = pos.copy()
+        disp_best = None
         grad = grad_func(pos_seg, z_seg)
         apply_cone_and_plane_masking(
             grad, pos_seg, ptc_origin, axis, tunnel_length, cone_half_angle_deg, lip_plane_distance
@@ -467,8 +826,91 @@ def _segment_pass(
         if g_norm < 1e-6:
             break
         step = 0.3 / (g_norm + 1e-9)
-        pos_seg = pos_seg - step * grad
+        delta_grad = -step * grad
+        if a > 0.0:
+            sel = choose_best_translation_direction(
+                grad=grad,
+                positions=pos_seg,
+                step=ensemble_translation_step,
+                span=ensemble_decay_span,
+                p=ensemble_s2_power,
+                beta=ensemble_beta,
+                score_lambda=ensemble_score_lambda,
+                direction_set=direction_set_active,
+                sources=(0, -1),
+                residue_masses=z_seg,
+                left_anchor_infinite=True,
+                linear_momentum_state=linear_momentum_state,
+                barrier_budget_state=barrier_budget_state,
+                inertial_dt=ensemble_inertial_dt if use_target_inertial else 1.0,
+                linear_damping=ensemble_linear_damping if use_target_inertial else 0.0,
+                linear_gain=ensemble_linear_gain if use_target_inertial else 1.0,
+                damping_mode=ensemble_damping_mode if use_target_inertial else "linear",
+                barrier_decay=ensemble_barrier_decay if use_target_inertial else 1.0,
+                barrier_build=ensemble_barrier_build if use_target_inertial else 0.0,
+                barrier_relief=ensemble_barrier_relief if use_target_inertial else 0.0,
+                resonance_state=resonance_state,
+                omega_state=omega_state,
+                angular_mix=ensemble_angular_mix_alpha if use_target_inertial else 0.0,
+                angular_damping=ensemble_angular_damping if use_target_inertial else 0.0,
+                angular_gain=ensemble_angular_gain if use_target_inertial else 0.0,
+            )
+            disp_best = np.asarray(sel["best_disp"], dtype=float)
+            linear_momentum_state = np.asarray(
+                sel.get("best_linear_momentum_state", linear_momentum_state), dtype=float
+            ).reshape(L, 3)
+            barrier_budget_state = np.asarray(
+                sel.get("best_barrier_budget_state", barrier_budget_state), dtype=float
+            ).reshape(L,)
+            resonance_state = float(sel.get("best_resonance_state", resonance_state))
+            omega_state = np.asarray(sel.get("best_omega_state", omega_state), dtype=float).reshape(3,)
+            # Enforce cone + lip constraints on the chosen displacement.
+            apply_cone_and_plane_masking_on_displacement(
+                disp_best,
+                pos_seg,
+                ptc_origin,
+                axis,
+                tunnel_length,
+                cone_half_angle_deg,
+                lip_plane_distance,
+            )
+            # Scale displacement to match gradient-step magnitude.
+            n_disp = float(np.linalg.norm(disp_best)) + 1e-14
+            n_grad = float(np.linalg.norm(delta_grad)) + 1e-14
+            disp_scaled = disp_best * (n_grad / n_disp)
+            pos_seg = pos_seg + (1.0 - a) * delta_grad + a * disp_scaled
+        else:
+            pos_seg = pos_seg + delta_grad
         pos_seg = project_bonds(pos_seg, r_min=r_bond_min, r_max=r_bond_max)
+        pos_after_full = pos.copy()
+        pos_after_full[i:j] = pos_seg
+        if a > 0.0:
+            g_full = grad_func(pos_after_full, z_list)
+            apply_cone_and_plane_masking(
+                g_full,
+                pos_after_full,
+                ptc_origin,
+                axis,
+                tunnel_length,
+                cone_half_angle_deg,
+                lip_plane_distance,
+            )
+            direction_set_active, _, _, _ = maybe_refresh_em_field_direction_set(
+                pos_full_before,
+                pos_after_full,
+                g_full,
+                direction_set,
+                direction_set_active,
+                disp_best,
+                refresh_on_horizon_crossing=bool(ensemble_em_refresh_on_horizon_crossing),
+                refresh_on_horizon_leaving=bool(ensemble_em_refresh_on_horizon_leaving),
+                horizon_ang=float(ensemble_em_refresh_horizon_ang),
+                min_seq_sep=int(ensemble_em_refresh_min_seq_sep),
+                refresh_on_large_disp=bool(ensemble_em_refresh_on_large_disp),
+                large_disp_thresh=float(ensemble_em_refresh_large_disp_thresh),
+                max_extra_vectors=int(ensemble_em_max_extra_directions),
+            )
+        pos[i:j] = pos_seg
 
     pos_seg, n_iter = run_masked_lbfgs_pass(
         pos_seg,
@@ -485,6 +927,33 @@ def _segment_pass(
         r_bond_max=r_bond_max,
         hke_above_tunnel_fraction=hke_above_tunnel_fraction,
         energy_func_ca=energy_func_ca,
+        ensemble_translation_mix_alpha=ensemble_translation_mix_alpha,
+        ensemble_translation_step=ensemble_translation_step,
+        ensemble_decay_span=ensemble_decay_span,
+        ensemble_beta=ensemble_beta,
+        ensemble_s2_power=ensemble_s2_power,
+        ensemble_score_lambda=ensemble_score_lambda,
+        ensemble_inertial_dt=ensemble_inertial_dt,
+        ensemble_linear_damping=ensemble_linear_damping,
+        ensemble_linear_gain=ensemble_linear_gain,
+        ensemble_damping_mode=ensemble_damping_mode,
+        ensemble_barrier_decay=ensemble_barrier_decay,
+        ensemble_barrier_build=ensemble_barrier_build,
+        ensemble_barrier_relief=ensemble_barrier_relief,
+        ensemble_target_transition_only=ensemble_target_transition_only,
+        ensemble_target_mix_alpha=ensemble_target_mix_alpha,
+        ensemble_target_mix_tolerance=ensemble_target_mix_tolerance,
+        ensemble_angular_mix_alpha=ensemble_angular_mix_alpha,
+        ensemble_angular_damping=ensemble_angular_damping,
+        ensemble_angular_gain=ensemble_angular_gain,
+        ensemble_direction_set=ensemble_direction_set,
+        ensemble_em_refresh_on_horizon_crossing=bool(ensemble_em_refresh_on_horizon_crossing),
+        ensemble_em_refresh_on_horizon_leaving=bool(ensemble_em_refresh_on_horizon_leaving),
+        ensemble_em_refresh_horizon_ang=float(ensemble_em_refresh_horizon_ang),
+        ensemble_em_refresh_min_seq_sep=int(ensemble_em_refresh_min_seq_sep),
+        ensemble_em_refresh_on_large_disp=bool(ensemble_em_refresh_on_large_disp),
+        ensemble_em_refresh_large_disp_thresh=float(ensemble_em_refresh_large_disp_thresh),
+        ensemble_em_max_extra_directions=int(ensemble_em_max_extra_directions),
     )
     if (
         tunnel_thermal_gradient_steps > 0
@@ -549,6 +1018,33 @@ def _binary_tree_minimize(
     tunnel_thermal_rng: Optional[np.random.Generator],
     tunnel_thermal_stats: Optional[Dict[str, Any]],
     energy_func_ca: Optional[EnergyFuncCA] = None,
+    ensemble_translation_mix_alpha: float = 0.0,
+    ensemble_translation_step: float = 0.35,
+    ensemble_decay_span: float = 0.25,
+    ensemble_beta: float = 0.35,
+    ensemble_s2_power: float = 1.0,
+    ensemble_score_lambda: float = 0.0,
+    ensemble_inertial_dt: float = 1.0,
+    ensemble_linear_damping: float = 0.9,
+    ensemble_linear_gain: float = 1.0,
+    ensemble_damping_mode: str = "linear",
+    ensemble_barrier_decay: float = 0.95,
+    ensemble_barrier_build: float = 0.05,
+    ensemble_barrier_relief: float = 0.25,
+    ensemble_target_transition_only: bool = False,
+    ensemble_target_mix_alpha: float = 0.03,
+    ensemble_target_mix_tolerance: float = 1e-9,
+    ensemble_angular_mix_alpha: float = 0.0,
+    ensemble_angular_damping: float = 0.9,
+    ensemble_angular_gain: float = 0.2,
+    ensemble_direction_set: Optional[np.ndarray] = None,
+    ensemble_em_refresh_on_horizon_crossing: bool = True,
+    ensemble_em_refresh_on_horizon_leaving: bool = False,
+    ensemble_em_refresh_horizon_ang: float = 15.0,
+    ensemble_em_refresh_min_seq_sep: int = 3,
+    ensemble_em_refresh_on_large_disp: bool = False,
+    ensemble_em_refresh_large_disp_thresh: float = 0.35,
+    ensemble_em_max_extra_directions: int = 24,
 ) -> int:
     """Process segment [i:j] in binary-tree order: recurse on halves then relax junction. Returns total n_iter."""
     L = j - i
@@ -572,6 +1068,33 @@ def _binary_tree_minimize(
             tunnel_thermal_rng,
             tunnel_thermal_stats,
             energy_func_ca,
+            ensemble_translation_mix_alpha=ensemble_translation_mix_alpha,
+            ensemble_translation_step=ensemble_translation_step,
+            ensemble_decay_span=ensemble_decay_span,
+            ensemble_beta=ensemble_beta,
+            ensemble_s2_power=ensemble_s2_power,
+            ensemble_score_lambda=ensemble_score_lambda,
+            ensemble_inertial_dt=ensemble_inertial_dt,
+            ensemble_linear_damping=ensemble_linear_damping,
+            ensemble_linear_gain=ensemble_linear_gain,
+            ensemble_damping_mode=ensemble_damping_mode,
+            ensemble_barrier_decay=ensemble_barrier_decay,
+            ensemble_barrier_build=ensemble_barrier_build,
+            ensemble_barrier_relief=ensemble_barrier_relief,
+            ensemble_target_transition_only=ensemble_target_transition_only,
+            ensemble_target_mix_alpha=ensemble_target_mix_alpha,
+            ensemble_target_mix_tolerance=ensemble_target_mix_tolerance,
+            ensemble_angular_mix_alpha=ensemble_angular_mix_alpha,
+            ensemble_angular_damping=ensemble_angular_damping,
+            ensemble_angular_gain=ensemble_angular_gain,
+            ensemble_direction_set=ensemble_direction_set,
+            ensemble_em_refresh_on_horizon_crossing=bool(ensemble_em_refresh_on_horizon_crossing),
+            ensemble_em_refresh_on_horizon_leaving=bool(ensemble_em_refresh_on_horizon_leaving),
+            ensemble_em_refresh_horizon_ang=float(ensemble_em_refresh_horizon_ang),
+            ensemble_em_refresh_min_seq_sep=int(ensemble_em_refresh_min_seq_sep),
+            ensemble_em_refresh_on_large_disp=bool(ensemble_em_refresh_on_large_disp),
+            ensemble_em_refresh_large_disp_thresh=float(ensemble_em_refresh_large_disp_thresh),
+            ensemble_em_max_extra_directions=int(ensemble_em_max_extra_directions),
         )
         total += _binary_tree_minimize(
             pos, z_list, mid, j,
@@ -588,6 +1111,33 @@ def _binary_tree_minimize(
             tunnel_thermal_rng,
             tunnel_thermal_stats,
             energy_func_ca,
+            ensemble_translation_mix_alpha=ensemble_translation_mix_alpha,
+            ensemble_translation_step=ensemble_translation_step,
+            ensemble_decay_span=ensemble_decay_span,
+            ensemble_beta=ensemble_beta,
+            ensemble_s2_power=ensemble_s2_power,
+            ensemble_score_lambda=ensemble_score_lambda,
+            ensemble_inertial_dt=ensemble_inertial_dt,
+            ensemble_linear_damping=ensemble_linear_damping,
+            ensemble_linear_gain=ensemble_linear_gain,
+            ensemble_damping_mode=ensemble_damping_mode,
+            ensemble_barrier_decay=ensemble_barrier_decay,
+            ensemble_barrier_build=ensemble_barrier_build,
+            ensemble_barrier_relief=ensemble_barrier_relief,
+            ensemble_target_transition_only=ensemble_target_transition_only,
+            ensemble_target_mix_alpha=ensemble_target_mix_alpha,
+            ensemble_target_mix_tolerance=ensemble_target_mix_tolerance,
+            ensemble_angular_mix_alpha=ensemble_angular_mix_alpha,
+            ensemble_angular_damping=ensemble_angular_damping,
+            ensemble_angular_gain=ensemble_angular_gain,
+            ensemble_direction_set=ensemble_direction_set,
+            ensemble_em_refresh_on_horizon_crossing=bool(ensemble_em_refresh_on_horizon_crossing),
+            ensemble_em_refresh_on_horizon_leaving=bool(ensemble_em_refresh_on_horizon_leaving),
+            ensemble_em_refresh_horizon_ang=float(ensemble_em_refresh_horizon_ang),
+            ensemble_em_refresh_min_seq_sep=int(ensemble_em_refresh_min_seq_sep),
+            ensemble_em_refresh_on_large_disp=bool(ensemble_em_refresh_on_large_disp),
+            ensemble_em_refresh_large_disp_thresh=float(ensemble_em_refresh_large_disp_thresh),
+            ensemble_em_max_extra_directions=int(ensemble_em_max_extra_directions),
         )
     total += _segment_pass(
         pos, z_list, i, j,
@@ -604,6 +1154,33 @@ def _binary_tree_minimize(
         tunnel_thermal_rng,
         tunnel_thermal_stats,
         energy_func_ca,
+        ensemble_translation_mix_alpha=ensemble_translation_mix_alpha,
+        ensemble_translation_step=ensemble_translation_step,
+        ensemble_decay_span=ensemble_decay_span,
+        ensemble_beta=ensemble_beta,
+        ensemble_s2_power=ensemble_s2_power,
+        ensemble_score_lambda=ensemble_score_lambda,
+        ensemble_inertial_dt=ensemble_inertial_dt,
+        ensemble_linear_damping=ensemble_linear_damping,
+        ensemble_linear_gain=ensemble_linear_gain,
+        ensemble_damping_mode=ensemble_damping_mode,
+        ensemble_barrier_decay=ensemble_barrier_decay,
+        ensemble_barrier_build=ensemble_barrier_build,
+        ensemble_barrier_relief=ensemble_barrier_relief,
+        ensemble_target_transition_only=ensemble_target_transition_only,
+        ensemble_target_mix_alpha=ensemble_target_mix_alpha,
+        ensemble_target_mix_tolerance=ensemble_target_mix_tolerance,
+        ensemble_angular_mix_alpha=ensemble_angular_mix_alpha,
+        ensemble_angular_damping=ensemble_angular_damping,
+        ensemble_angular_gain=ensemble_angular_gain,
+        ensemble_direction_set=ensemble_direction_set,
+        ensemble_em_refresh_on_horizon_crossing=bool(ensemble_em_refresh_on_horizon_crossing),
+        ensemble_em_refresh_on_horizon_leaving=bool(ensemble_em_refresh_on_horizon_leaving),
+        ensemble_em_refresh_horizon_ang=float(ensemble_em_refresh_horizon_ang),
+        ensemble_em_refresh_min_seq_sep=int(ensemble_em_refresh_min_seq_sep),
+        ensemble_em_refresh_on_large_disp=bool(ensemble_em_refresh_on_large_disp),
+        ensemble_em_refresh_large_disp_thresh=float(ensemble_em_refresh_large_disp_thresh),
+        ensemble_em_max_extra_directions=int(ensemble_em_max_extra_directions),
     )
     return total
 
@@ -631,7 +1208,39 @@ def co_translational_minimize(
     tunnel_thermal_step_size: float = 0.025,
     tunnel_thermal_quick_cap: bool = False,
     tunnel_thermal_seed: Optional[int] = None,
+    tunnel_free_terminus_steps: int = 0,
+    tunnel_free_terminus_window: int = 10,
+    tunnel_handedness_bias_weight: float = 0.0,
+    tunnel_handedness_target: float = 0.4,
+    tunnel_handedness_sign: float = 1.0,
     energy_func_ca: Optional[EnergyFuncCA] = None,
+    ensemble_translation_mix_alpha: float = 0.0,
+    ensemble_translation_step: float = 0.35,
+    ensemble_decay_span: float = 0.25,
+    ensemble_beta: float = 0.35,
+    ensemble_s2_power: float = 1.0,
+    ensemble_score_lambda: float = 0.0,
+    ensemble_inertial_dt: float = 1.0,
+    ensemble_linear_damping: float = 0.9,
+    ensemble_linear_gain: float = 1.0,
+    ensemble_damping_mode: str = "linear",
+    ensemble_barrier_decay: float = 0.95,
+    ensemble_barrier_build: float = 0.05,
+    ensemble_barrier_relief: float = 0.25,
+    ensemble_target_transition_only: bool = False,
+    ensemble_target_mix_alpha: float = 0.03,
+    ensemble_target_mix_tolerance: float = 1e-9,
+    ensemble_angular_mix_alpha: float = 0.0,
+    ensemble_angular_damping: float = 0.9,
+    ensemble_angular_gain: float = 0.2,
+    ensemble_direction_set: Optional[np.ndarray] = None,
+    ensemble_em_refresh_on_horizon_crossing: bool = True,
+    ensemble_em_refresh_on_horizon_leaving: bool = False,
+    ensemble_em_refresh_horizon_ang: float = 15.0,
+    ensemble_em_refresh_min_seq_sep: int = 3,
+    ensemble_em_refresh_on_large_disp: bool = False,
+    ensemble_em_refresh_large_disp_thresh: float = 0.35,
+    ensemble_em_max_extra_directions: int = 24,
 ) -> Tuple[np.ndarray, dict]:
     """
     Co-translational minimization: binary-tree schedule (instead of running down the chain
@@ -683,7 +1292,55 @@ def co_translational_minimize(
         th_rng,
         th_stats,
         _e_tunnel,
+        ensemble_translation_mix_alpha=float(ensemble_translation_mix_alpha),
+        ensemble_translation_step=float(ensemble_translation_step),
+        ensemble_decay_span=float(ensemble_decay_span),
+        ensemble_beta=float(ensemble_beta),
+        ensemble_s2_power=float(ensemble_s2_power),
+        ensemble_score_lambda=float(ensemble_score_lambda),
+        ensemble_inertial_dt=float(ensemble_inertial_dt),
+        ensemble_linear_damping=float(ensemble_linear_damping),
+        ensemble_linear_gain=float(ensemble_linear_gain),
+        ensemble_damping_mode=str(ensemble_damping_mode),
+        ensemble_barrier_decay=float(ensemble_barrier_decay),
+        ensemble_barrier_build=float(ensemble_barrier_build),
+        ensemble_barrier_relief=float(ensemble_barrier_relief),
+        ensemble_target_transition_only=bool(ensemble_target_transition_only),
+        ensemble_target_mix_alpha=float(ensemble_target_mix_alpha),
+        ensemble_target_mix_tolerance=float(ensemble_target_mix_tolerance),
+        ensemble_angular_mix_alpha=float(ensemble_angular_mix_alpha),
+        ensemble_angular_damping=float(ensemble_angular_damping),
+        ensemble_angular_gain=float(ensemble_angular_gain),
+        ensemble_direction_set=ensemble_direction_set,
+        ensemble_em_refresh_on_horizon_crossing=bool(ensemble_em_refresh_on_horizon_crossing),
+        ensemble_em_refresh_on_horizon_leaving=bool(ensemble_em_refresh_on_horizon_leaving),
+        ensemble_em_refresh_horizon_ang=float(ensemble_em_refresh_horizon_ang),
+        ensemble_em_refresh_min_seq_sep=int(ensemble_em_refresh_min_seq_sep),
+        ensemble_em_refresh_on_large_disp=bool(ensemble_em_refresh_on_large_disp),
+        ensemble_em_refresh_large_disp_thresh=float(ensemble_em_refresh_large_disp_thresh),
+        ensemble_em_max_extra_directions=int(ensemble_em_max_extra_directions),
     )
+    term_info: Dict[str, Any] = {"n_steps": 0, "message": "tunnel_free_terminus_handedness_relax: disabled"}
+    if int(tunnel_free_terminus_steps) > 0:
+        pos, term_info = tunnel_free_terminus_handedness_relax(
+            pos,
+            z_list,
+            ptc_origin,
+            axis,
+            tunnel_length,
+            cone_half_angle_deg,
+            lip_plane_distance,
+            grad_func,
+            project_bonds,
+            n_steps=int(tunnel_free_terminus_steps),
+            window_size=int(tunnel_free_terminus_window),
+            handedness_weight=float(tunnel_handedness_bias_weight),
+            handedness_target=float(tunnel_handedness_target),
+            handedness_sign=float(tunnel_handedness_sign),
+            step_size=float(tunnel_thermal_step_size),
+            r_bond_min=float(r_bond_min),
+            r_bond_max=float(r_bond_max),
+        )
 
     e_final = float(_e_tunnel(pos, z_list))
     info: Dict[str, Any] = {
@@ -693,6 +1350,7 @@ def co_translational_minimize(
         "success": True,
         "message": "Co-translational tunnel (binary-tree fast-pass + connection-triggered HKE)",
         "tunnel_thermal_gradient_steps": int(tunnel_thermal_gradient_steps),
+        "tunnel_free_terminus": term_info,
     }
     if th_stats is not None:
         info["tunnel_thermal_segments"] = int(th_stats.get("segments", 0))

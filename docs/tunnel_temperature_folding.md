@@ -186,3 +186,23 @@ So we are on the same footing as other teams: we use the same experimental data 
 
 **In-tunnel thermal gradient (aligned with post-extrusion Langevin):** After each binary-tree segment’s masked L-BFGS pass, you can run **kT-scaled noisy gradient descent** on that segment using the **same** `grad_func` and **same** cone / lip / `hke_above_tunnel_fraction` masking as the L-BFGS step (`tunnel_thermal_gradient_relax_segment` in `co_translational_tunnel.py`). The thermal scale is **`refinement_temperature_k`** / body **`temperature_k`** on the Lean path. Python: `tunnel_thermal_gradient_steps` on `minimize_full_chain` / `fold_lean_ribosome_tunnel`. Server: **`CASP_LEAN_TUNNEL_THERMAL_STEPS`**, **`CASP_LEAN_TUNNEL_THERMAL_NOISE_FRAC`**, optional **`CASP_LEAN_TUNNEL_THERMAL_SEED`**. Default **0** preserves the old deterministic tunnel. **`quick=True`** caps per-segment thermal steps at **12** to bound cost.
 
+---
+
+### 9. WHIP stepwise A/B vs experimental crambin (1CRN)
+
+To compare **force-carrier (WHIP)** translation knobs on **equal footing**, use **`scripts/crambin_stepwise_side_by_side.py`**: it builds **one shared** tunnel snapshot, then runs several variants (sqrt vs resonant, EM field direction refresh on/off, barrier/leak settings) with identical gradient steps and bond projection. Output JSON includes per-step **gap vs native long-range pairs**, optional subsampled **Cα-RMSD** vs `proteins/1CRN.pdb`, and **large-translation events** (displacement threshold + pair-distance drop). Example:
+
+`python3 scripts/crambin_stepwise_side_by_side.py --out .casp_grade_outputs/iter_small/crambin_stepwise_side_by_side.json` (default **1000** translation steps per variant; override with `--max-steps`.)
+
+For a fast smoke test: `--quick-snapshot --max-steps 15 --rmsd-every 0`.
+
+**Run until motion stalls** (instead of a fixed step budget): `--until-still --safety-max-steps 30000 --record-every 25` stops when scaled carrier motion stays below `--motion-floor` for `--still-patience` consecutive steps, or when `||grad|| < --grad-tol`, or at the safety cap. Each result includes **`fold_analysis`**: Cα clash count, Ramachandran distance to alpha/beta basins vs 1CRN, **missed native contacts** (pairs &lt;7.5 Å in the reference but opened in the prediction), **spurious tight long-range** pairs, **`tuning_hints`** for pruning bad geometry, and **`n_translation_steps`** (every WHIP iteration counts as one translation).
+
+**`stepwise_diagnostics`** (always): summarizes the **translation timeline** — best mean native-pair gap step, first rebound after that optimum, RMSD sample extrema, per tracked pair the step closest to native, and short **narrative** hints. When the run ends on a **step cap**, use this plus **`records`** to see *where* progress toward gold stalled or reversed, then tune WHIP / long-range / refine stages accordingly.
+
+The built-in variant panel uses **larger `carrier_step` / `carrier_span`**, a higher **`wave_leak_floor`**, and slightly higher **`linear_gain`** / barrier drive so terminus-emitted carrier waves **propagate farther and bend the chain faster**. A small **`collective_kink_weight`** on `grad_full` (HQIV Cα kink budget toward the default helix reference) helps keep those stronger waves from drifting into **unphysical** local kink geometry; tune weights if RMSD improves but Ramachandran or clash metrics degrade.
+
+Selection policy: by default (`--variants all`) the script runs the **admissible subset** aligned with Lean `ProteinVariantSelection` (clash-safe, Ramachandran-clean). Other variants are still defined and can be run explicitly via `--variants <name1,name2,...>` for diagnostics.
+
+**WHIP / force-carrier EM direction refresh (production minimizer):** when `ensemble_translation_mix_alpha > 0`, `_minimize_bonds_fast` and the co-translational tunnel passes rebuild the EM-augmented translation direction set whenever a **nonlocal** Cα pair (sequence separation ≥ `ensemble_em_refresh_min_seq_sep`, default 3) crosses **into** the horizon sphere of radius **`ensemble_em_refresh_horizon_ang`** (default **15 Å**, same as `folding_energy.R_HORIZON` / `grad_horizon_full`). Counting uses `folding_energy.count_nonlocal_pairs_entering_horizon`. If **`ensemble_em_refresh_on_horizon_leaving`** is True, a symmetric **`count_nonlocal_pairs_leaving_horizon`** trigger also rebuilds the set when a pair moves **out** of that radius (horizon coupling drops off). Optional **`ensemble_em_refresh_on_large_disp`** restores the older displacement-based trigger. Tunables live on `minimize_full_chain` (`ensemble_em_refresh_*`).
+

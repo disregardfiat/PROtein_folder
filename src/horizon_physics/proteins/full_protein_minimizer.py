@@ -50,6 +50,8 @@ from .casp_submission import (
 from .folding_energy import (
     e_tot,
     e_tot_ca_with_bonds,
+    count_variational_pairs_ca,
+    variational_pair_lower_bound_term,
     grad_full,
     grad_bonds_only,
     rg_squared,
@@ -60,6 +62,11 @@ from .folding_energy import (
 from .gradient_descent_folding import minimize_e_tot_lbfgs, _project_bonds
 from . import co_translational_tunnel as _tunnel
 from .co_translational_tunnel import rigid_body_force_torque
+from .force_carrier_ensemble import (
+    build_direction_set_6_axes,
+    choose_best_translation_direction,
+    maybe_refresh_em_field_direction_set,
+)
 from .ligands import LigandAgent, parse_ligands
 from .peptide_backbone import backbone_bond_lengths
 from .side_chain_placement import chi_angles_for_residue, side_chain_chi_preferences
@@ -83,6 +90,35 @@ def _minimize_bonds_fast(
     grad_full_extra_kwargs: Optional[Dict[str, Any]] = None,
     grad_extra_fn: Optional[Callable[[np.ndarray, np.ndarray], np.ndarray]] = None,
     fast_local_theta: bool = False,
+    variational_bound_prune: bool = False,
+    variational_bound_prune_margin: float = 0.0,
+    ensemble_translation_mix_alpha: float = 0.0,
+    ensemble_translation_step: float = 0.35,
+    ensemble_decay_span: float = 0.25,
+    ensemble_beta: float = 0.35,
+    ensemble_s2_power: float = 1.0,
+    ensemble_score_lambda: float = 0.0,
+    ensemble_inertial_dt: float = 1.0,
+    ensemble_linear_damping: float = 0.9,
+    ensemble_linear_gain: float = 1.0,
+    ensemble_damping_mode: str = "linear",
+    ensemble_barrier_decay: float = 0.95,
+    ensemble_barrier_build: float = 0.05,
+    ensemble_barrier_relief: float = 0.25,
+    ensemble_target_transition_only: bool = False,
+    ensemble_target_mix_alpha: float = 0.03,
+    ensemble_target_mix_tolerance: float = 1e-9,
+    ensemble_angular_mix_alpha: float = 0.0,
+    ensemble_angular_damping: float = 0.9,
+    ensemble_angular_gain: float = 0.2,
+    ensemble_direction_set: Optional[np.ndarray] = None,
+    ensemble_em_refresh_on_horizon_crossing: bool = True,
+    ensemble_em_refresh_on_horizon_leaving: bool = False,
+    ensemble_em_refresh_horizon_ang: float = 15.0,
+    ensemble_em_refresh_min_seq_sep: int = 3,
+    ensemble_em_refresh_on_large_disp: bool = False,
+    ensemble_em_refresh_large_disp_thresh: float = 0.35,
+    ensemble_em_max_extra_directions: int = 24,
 ) -> Tuple[np.ndarray, Dict[str, float]]:
     """
     Fast minimization for long chains. Default: bonds + full vector-sum horizon (analytical).
@@ -98,6 +134,18 @@ def _minimize_bonds_fast(
     k_rg = k_rg_collapse if k_rg_collapse is not None else K_RG_COLLAPSE
     pos = np.array(ca_init, dtype=float)
     n = pos.shape[0]
+    direction_set = ensemble_direction_set
+    if direction_set is None:
+        direction_set = build_direction_set_6_axes()
+    direction_set_active = np.asarray(direction_set, dtype=float)
+    a_mix = float(ensemble_translation_mix_alpha)
+    use_target_inertial = (not bool(ensemble_target_transition_only)) or (
+        abs(a_mix - float(ensemble_target_mix_alpha)) <= float(ensemble_target_mix_tolerance)
+    )
+    linear_momentum_state = np.zeros((n, 3), dtype=float)
+    barrier_budget_state = np.zeros((n,), dtype=float)
+    resonance_state = 0.0
+    omega_state = np.zeros(3, dtype=float)
     r_min_tight, r_max_tight = 2.5, 6.0
     # During collapse allow tighter spacing (r_min_loose) so chain can compactify; projection won't re-extend
     r_min_loose = 2.0
@@ -112,13 +160,74 @@ def _minimize_bonds_fast(
     # Optional: compact init via Rg-only steps (pull toward COM while keeping bonds)
     if collapse and collapse_init_steps > 0:
         for _ in range(collapse_init_steps):
+            pos_before = pos.copy()
             grad = (k_rg * grad_rg_squared(pos)).astype(pos.dtype)
             g_norm = np.linalg.norm(grad)
             if g_norm < 1e-9:
                 break
             step = 1.0 / (g_norm + 1e-6)
-            pos = pos - step * grad
+            delta_grad = -step * grad
+            disp_best = None
+            if a_mix > 0.0:
+                sel = choose_best_translation_direction(
+                    grad=grad,
+                    positions=pos,
+                    step=ensemble_translation_step,
+                    span=ensemble_decay_span,
+                    p=ensemble_s2_power,
+                    beta=ensemble_beta,
+                    score_lambda=ensemble_score_lambda,
+                    direction_set=direction_set_active,
+                    sources=(0, -1),
+                    residue_masses=z_list,
+                    left_anchor_infinite=False,
+                    linear_momentum_state=linear_momentum_state,
+                    barrier_budget_state=barrier_budget_state,
+                    inertial_dt=ensemble_inertial_dt if use_target_inertial else 1.0,
+                    linear_damping=ensemble_linear_damping if use_target_inertial else 0.0,
+                    linear_gain=ensemble_linear_gain if use_target_inertial else 1.0,
+                    damping_mode=ensemble_damping_mode if use_target_inertial else "linear",
+                    barrier_decay=ensemble_barrier_decay if use_target_inertial else 1.0,
+                    barrier_build=ensemble_barrier_build if use_target_inertial else 0.0,
+                    barrier_relief=ensemble_barrier_relief if use_target_inertial else 0.0,
+                    resonance_state=resonance_state,
+                    omega_state=omega_state,
+                    angular_mix=ensemble_angular_mix_alpha if use_target_inertial else 0.0,
+                    angular_damping=ensemble_angular_damping if use_target_inertial else 0.0,
+                    angular_gain=ensemble_angular_gain if use_target_inertial else 0.0,
+                )
+                disp_best = np.asarray(sel["best_disp"], dtype=float)
+                linear_momentum_state = np.asarray(
+                    sel.get("best_linear_momentum_state", linear_momentum_state), dtype=float
+                ).reshape(n, 3)
+                barrier_budget_state = np.asarray(
+                    sel.get("best_barrier_budget_state", barrier_budget_state), dtype=float
+                ).reshape(n,)
+                resonance_state = float(sel.get("best_resonance_state", resonance_state))
+                omega_state = np.asarray(sel.get("best_omega_state", omega_state), dtype=float).reshape(3,)
+                n_disp = float(np.linalg.norm(disp_best)) + 1e-14
+                n_delta = float(np.linalg.norm(delta_grad)) + 1e-14
+                disp_scaled = disp_best * (n_delta / n_disp)
+                pos = pos + (1.0 - a_mix) * delta_grad + a_mix * disp_scaled
+            else:
+                pos = pos + delta_grad
             pos = _project_bonds(pos, r_min=r_min_loose, r_max=loose_r_max)
+            if a_mix > 0.0:
+                direction_set_active, _, _, _ = maybe_refresh_em_field_direction_set(
+                    pos_before,
+                    pos,
+                    grad,
+                    direction_set,
+                    direction_set_active,
+                    disp_best,
+                    refresh_on_horizon_crossing=bool(ensemble_em_refresh_on_horizon_crossing),
+                    refresh_on_horizon_leaving=bool(ensemble_em_refresh_on_horizon_leaving),
+                    horizon_ang=float(ensemble_em_refresh_horizon_ang),
+                    min_seq_sep=int(ensemble_em_refresh_min_seq_sep),
+                    refresh_on_large_disp=bool(ensemble_em_refresh_on_large_disp),
+                    large_disp_thresh=float(ensemble_em_refresh_large_disp_thresh),
+                    max_extra_vectors=int(ensemble_em_max_extra_directions),
+                )
             total_iter += 1
             write_trajectory_frame(trajectory_log, total_iter, pos)
             if on_step_callback is not None:
@@ -129,32 +238,115 @@ def _minimize_bonds_fast(
     # Larger step during collapse (1.5/g_norm) so chain actually moves toward COM.
     if n_collapse > 0:
         for it in range(n_collapse):
+            pos_before = pos.copy()
             grad = grad_bonds_only(pos, r_min=r_min_loose, r_max=loose_r_max)
             grad = grad + k_rg * grad_rg_squared(pos)
             g_norm = np.linalg.norm(grad)
             if g_norm < 1e-4:
                 break
             step = 3.0 / (g_norm + 1e-6)  # larger step in collapse phase to reach compact state
-            pos = pos - step * grad
+            delta_grad = -step * grad
+            disp_best = None
+            if a_mix > 0.0:
+                sel = choose_best_translation_direction(
+                    grad=grad,
+                    positions=pos,
+                    step=ensemble_translation_step,
+                    span=ensemble_decay_span,
+                    p=ensemble_s2_power,
+                    beta=ensemble_beta,
+                    score_lambda=ensemble_score_lambda,
+                    direction_set=direction_set_active,
+                    sources=(0, -1),
+                    residue_masses=z_list,
+                    left_anchor_infinite=False,
+                    linear_momentum_state=linear_momentum_state,
+                    barrier_budget_state=barrier_budget_state,
+                    inertial_dt=ensemble_inertial_dt if use_target_inertial else 1.0,
+                    linear_damping=ensemble_linear_damping if use_target_inertial else 0.0,
+                    linear_gain=ensemble_linear_gain if use_target_inertial else 1.0,
+                    damping_mode=ensemble_damping_mode if use_target_inertial else "linear",
+                    barrier_decay=ensemble_barrier_decay if use_target_inertial else 1.0,
+                    barrier_build=ensemble_barrier_build if use_target_inertial else 0.0,
+                    barrier_relief=ensemble_barrier_relief if use_target_inertial else 0.0,
+                    resonance_state=resonance_state,
+                    omega_state=omega_state,
+                    angular_mix=ensemble_angular_mix_alpha if use_target_inertial else 0.0,
+                    angular_damping=ensemble_angular_damping if use_target_inertial else 0.0,
+                    angular_gain=ensemble_angular_gain if use_target_inertial else 0.0,
+                )
+                disp_best = np.asarray(sel["best_disp"], dtype=float)
+                linear_momentum_state = np.asarray(
+                    sel.get("best_linear_momentum_state", linear_momentum_state), dtype=float
+                ).reshape(n, 3)
+                barrier_budget_state = np.asarray(
+                    sel.get("best_barrier_budget_state", barrier_budget_state), dtype=float
+                ).reshape(n,)
+                resonance_state = float(sel.get("best_resonance_state", resonance_state))
+                omega_state = np.asarray(sel.get("best_omega_state", omega_state), dtype=float).reshape(3,)
+                n_disp = float(np.linalg.norm(disp_best)) + 1e-14
+                n_delta = float(np.linalg.norm(delta_grad)) + 1e-14
+                disp_scaled = disp_best * (n_delta / n_disp)
+                pos = pos + (1.0 - a_mix) * delta_grad + a_mix * disp_scaled
+            else:
+                pos = pos + delta_grad
             pos = _project_bonds(pos, r_min=r_min_loose, r_max=loose_r_max)
+            if a_mix > 0.0:
+                direction_set_active, _, _, _ = maybe_refresh_em_field_direction_set(
+                    pos_before,
+                    pos,
+                    grad,
+                    direction_set,
+                    direction_set_active,
+                    disp_best,
+                    refresh_on_horizon_crossing=bool(ensemble_em_refresh_on_horizon_crossing),
+                    refresh_on_horizon_leaving=bool(ensemble_em_refresh_on_horizon_leaving),
+                    horizon_ang=float(ensemble_em_refresh_horizon_ang),
+                    min_seq_sep=int(ensemble_em_refresh_min_seq_sep),
+                    refresh_on_large_disp=bool(ensemble_em_refresh_on_large_disp),
+                    large_disp_thresh=float(ensemble_em_refresh_large_disp_thresh),
+                    max_extra_vectors=int(ensemble_em_max_extra_directions),
+                )
             total_iter += 1
             write_trajectory_frame(trajectory_log, total_iter, pos)
             if on_step_callback is not None:
                 on_step_callback(total_iter, pos.copy())
 
     g_extra_kw = dict(grad_full_extra_kwargs or {})
+    best_e_seen = float("inf")
     # Stage 2: refine (tight bonds, no Rg); project into standard [2.5, 6] Å
     for it in range(n_refine):
+        pos_before = pos.copy()
         if fast_horizon:
             grad = grad_bonds_only(pos)
         else:
+            gkw_iter = dict(g_extra_kw)
+            if variational_bound_prune:
+                w_pair = float(gkw_iter.get("variational_pair_weight", 0.0))
+                if w_pair > 0.0:
+                    # Lean-style pruning: if lower bound for current state cannot beat best seen,
+                    # skip expensive variational FD gradient for this step.
+                    base_e = float(e_tot_ca_with_bonds(pos, z_list, fast_local_theta=fast_local_theta))
+                    n_pairs = count_variational_pairs_ca(
+                        pos,
+                        dist_cutoff=float(gkw_iter.get("variational_pair_dist_cutoff", 12.0)),
+                        min_seq_sep=int(gkw_iter.get("variational_pair_min_seq_sep", 3)),
+                        max_pairs=int(gkw_iter.get("variational_pair_max_pairs", 400)),
+                    )
+                    lb = base_e + variational_pair_lower_bound_term(
+                        n_pairs,
+                        pair_weight=w_pair,
+                        epsilon=float(gkw_iter.get("variational_pair_epsilon", 0.1)),
+                    )
+                    if np.isfinite(best_e_seen) and lb >= (best_e_seen - float(variational_bound_prune_margin)):
+                        gkw_iter["variational_pair_weight"] = 0.0
             grad = grad_full(
                 pos,
                 z_list,
                 include_bonds=True,
                 include_horizon=True,
                 include_clash=True,
-                **g_extra_kw,
+                **gkw_iter,
             )
         if grad_extra_fn is not None:
             grad = grad + grad_extra_fn(pos, z_list)
@@ -162,8 +354,71 @@ def _minimize_bonds_fast(
         if g_norm < 1e-4:
             break
         step = 0.5 / (g_norm + 1e-6)
-        pos = pos - step * grad
+        delta_grad = -step * grad
+        disp_best = None
+        if a_mix > 0.0:
+            sel = choose_best_translation_direction(
+                grad=grad,
+                positions=pos,
+                step=ensemble_translation_step,
+                span=ensemble_decay_span,
+                p=ensemble_s2_power,
+                beta=ensemble_beta,
+                score_lambda=ensemble_score_lambda,
+                direction_set=direction_set_active,
+                sources=(0, -1),
+                residue_masses=z_list,
+                left_anchor_infinite=False,
+                linear_momentum_state=linear_momentum_state,
+                barrier_budget_state=barrier_budget_state,
+                inertial_dt=ensemble_inertial_dt if use_target_inertial else 1.0,
+                linear_damping=ensemble_linear_damping if use_target_inertial else 0.0,
+                linear_gain=ensemble_linear_gain if use_target_inertial else 1.0,
+                damping_mode=ensemble_damping_mode if use_target_inertial else "linear",
+                barrier_decay=ensemble_barrier_decay if use_target_inertial else 1.0,
+                barrier_build=ensemble_barrier_build if use_target_inertial else 0.0,
+                barrier_relief=ensemble_barrier_relief if use_target_inertial else 0.0,
+                resonance_state=resonance_state,
+                omega_state=omega_state,
+                angular_mix=ensemble_angular_mix_alpha if use_target_inertial else 0.0,
+                angular_damping=ensemble_angular_damping if use_target_inertial else 0.0,
+                angular_gain=ensemble_angular_gain if use_target_inertial else 0.0,
+            )
+            disp_best = np.asarray(sel["best_disp"], dtype=float)
+            linear_momentum_state = np.asarray(
+                sel.get("best_linear_momentum_state", linear_momentum_state), dtype=float
+            ).reshape(n, 3)
+            barrier_budget_state = np.asarray(
+                sel.get("best_barrier_budget_state", barrier_budget_state), dtype=float
+            ).reshape(n,)
+            resonance_state = float(sel.get("best_resonance_state", resonance_state))
+            omega_state = np.asarray(sel.get("best_omega_state", omega_state), dtype=float).reshape(3,)
+            n_disp = float(np.linalg.norm(disp_best)) + 1e-14
+            n_delta = float(np.linalg.norm(delta_grad)) + 1e-14
+            disp_scaled = disp_best * (n_delta / n_disp)
+            pos = pos + (1.0 - a_mix) * delta_grad + a_mix * disp_scaled
+        else:
+            pos = pos + delta_grad
         pos = _project_bonds(pos, r_min=r_min_tight, r_max=r_max_tight)
+        if a_mix > 0.0:
+            direction_set_active, _, _, _ = maybe_refresh_em_field_direction_set(
+                pos_before,
+                pos,
+                grad,
+                direction_set,
+                direction_set_active,
+                disp_best,
+                refresh_on_horizon_crossing=bool(ensemble_em_refresh_on_horizon_crossing),
+                refresh_on_horizon_leaving=bool(ensemble_em_refresh_on_horizon_leaving),
+                horizon_ang=float(ensemble_em_refresh_horizon_ang),
+                min_seq_sep=int(ensemble_em_refresh_min_seq_sep),
+                refresh_on_large_disp=bool(ensemble_em_refresh_on_large_disp),
+                large_disp_thresh=float(ensemble_em_refresh_large_disp_thresh),
+                max_extra_vectors=int(ensemble_em_max_extra_directions),
+            )
+        e_step = float(e_tot_ca_with_bonds(pos, z_list, fast_local_theta=fast_local_theta))
+        if e_step < best_e_seen:
+            best_e_seen = e_step
         total_iter += 1
         write_trajectory_frame(trajectory_log, total_iter, pos)
         if on_step_callback is not None:
@@ -371,6 +626,95 @@ def pdb_hetatm_lines_for_ligands(
     return lines, atom_id
 
 
+def _apply_post_full_heavy_osh(
+    out: Dict[str, object],
+    seq: str,
+    *,
+    em_scale: float,
+    fast_local_theta: bool,
+    kwargs: Optional[Dict[str, Any]],
+) -> None:
+    """
+    Optional overlay: full heavy-atom OSH after fast Cα minimization.
+
+    Mutates ``out`` in place: updates ``ca_min``, ``backbone_atoms``, sets ``full_heavy_chain`` and
+    ``full_heavy_osh_info``. ``full_chain_to_pdb`` emits all-atom protein when ``full_heavy_chain`` is set.
+    """
+    import inspect
+
+    from .full_atom_topology import build_full_heavy_chain
+    from .osh_oracle_full_atom import minimize_full_heavy_with_osh_oracle
+
+    u = dict(kwargs or {})
+    inc_sc = bool(u.pop("include_sidechain_heavy", True))
+    ca_min = np.asarray(out["ca_min"], dtype=float)
+    chain = build_full_heavy_chain(seq, ca_min, include_sidechain_heavy=inc_sc)
+    e_kw = dict(u.pop("energy_kwargs", {}))
+    if fast_local_theta:
+        e_kw.setdefault("fast_local_theta", True)
+    if abs(float(em_scale) - 1.0) > 1e-12:
+        e_kw.setdefault("em_scale", float(em_scale))
+
+    sig = inspect.signature(minimize_full_heavy_with_osh_oracle)
+    skip = frozenset(
+        {
+            "pos_init",
+            "z",
+            "bond_edges",
+            "residue_ranges",
+            "ca_atom_indices",
+            "energy_kwargs",
+        }
+    )
+    mh: Dict[str, Any] = {}
+    for k in list(u.keys()):
+        if k in sig.parameters and k not in skip:
+            mh[k] = u.pop(k)
+    if u:
+        raise TypeError(
+            "post_full_heavy_osh_kwargs: unknown keys: " + ", ".join(sorted(u.keys()))
+        )
+
+    n_res = len(seq)
+    mh.setdefault("z_shell", 6)
+    mh.setdefault("n_iter", 200)
+    mh.setdefault("step_size", 0.02)
+    mh.setdefault("gate_mix", 0.55)
+    mh.setdefault("ansatz_depth", 2)
+    mh.setdefault("use_energy_reservoir", True)
+    mh.setdefault("reservoir_init", 40.0)
+    mh.setdefault("reservoir_gain_scale", 1.2)
+    mh.setdefault("harmonic_max_dims", min(240, max(72, 12 * n_res)))
+    mh.setdefault("backbone_projection_passes", 3)
+    mh["energy_kwargs"] = e_kw
+    # Full-atom physics should couple to Cα by default; optional ``freeze_ca_positions=True`` pins
+    # the trace (side-chain-only). Without a pin, cap per-iter Cα motion so projection + OSH steps
+    # do not explode the backbone (pass ``limit_ca_displacement_ang=None`` to disable).
+    if mh.get("freeze_ca_positions") is not True:
+        mh.setdefault("limit_ca_displacement_ang", 0.22)
+
+    pos1, info = minimize_full_heavy_with_osh_oracle(
+        chain.copy_positions(),
+        chain.z,
+        chain.bond_edges,
+        chain.residue_ranges,
+        chain.ca_atom_indices,
+        **mh,
+    )
+    chain.positions[:] = pos1
+    out["ca_min"] = chain.positions[np.asarray(chain.ca_atom_indices, dtype=int)].copy()
+    out["backbone_atoms"] = _place_full_backbone(out["ca_min"], seq)
+    out["full_heavy_chain"] = chain
+    out["full_heavy_osh_info"] = {
+        "accepted_steps": int(info.accepted_steps),
+        "iterations_executed": int(info.iterations_executed),
+        "final_energy_ev": float(info.final_energy_ev),
+        "stop_reason": str(info.stop_reason),
+        "settled": bool(info.settled),
+        "n_atoms": int(chain.positions.shape[0]),
+    }
+
+
 def minimize_full_chain(
     sequence: str,
     ca_init: Optional[np.ndarray] = None,
@@ -416,6 +760,11 @@ def minimize_full_chain(
     tunnel_thermal_step_size: Optional[float] = None,
     tunnel_thermal_reference_temperature_k: float = 310.0,
     tunnel_thermal_seed: Optional[int] = None,
+    tunnel_free_terminus_steps: int = 0,
+    tunnel_free_terminus_window: int = 10,
+    tunnel_handedness_bias_weight: float = 0.0,
+    tunnel_handedness_target: float = 0.4,
+    tunnel_handedness_sign: float = 1.0,
     em_scale: float = 1.0,
     kappa_dihedral: float = 0.0,
     hbond_weight: float = 0.0,
@@ -429,9 +778,50 @@ def minimize_full_chain(
     collective_kink_m: int = 3,
     collective_kink_theta_ref_rad: Optional[float] = None,
     collective_kink_use_ss_mask: bool = False,
+    variational_pair_weight: float = 0.0,
+    variational_pair_epsilon: float = 0.1,
+    variational_pair_sigma: float = 4.0,
+    variational_pair_dist_cutoff: float = 12.0,
+    variational_pair_min_seq_sep: int = 3,
+    variational_pair_max_pairs: int = 400,
+    variational_staged_opt: bool = False,
+    variational_stage_frac: float = 0.5,
+    variational_bound_prune: bool = False,
+    variational_bound_prune_margin: float = 0.0,
+    inertial_twist_weight: float = 0.0,
+    inertial_twist_theta_ref_rad: Optional[float] = None,
+    inertial_twist_exponent: float = 1.0,
+    ensemble_translation_mix_alpha: float = 0.0,
+    ensemble_translation_step: float = 0.35,
+    ensemble_decay_span: float = 0.25,
+    ensemble_beta: float = 0.35,
+    ensemble_s2_power: float = 1.0,
+    ensemble_score_lambda: float = 0.0,
+    ensemble_inertial_dt: float = 1.0,
+    ensemble_linear_damping: float = 0.9,
+    ensemble_linear_gain: float = 1.0,
+    ensemble_damping_mode: str = "linear",
+    ensemble_barrier_decay: float = 0.95,
+    ensemble_barrier_build: float = 0.05,
+    ensemble_barrier_relief: float = 0.25,
+    ensemble_target_transition_only: bool = False,
+    ensemble_target_mix_alpha: float = 0.03,
+    ensemble_target_mix_tolerance: float = 1e-9,
+    ensemble_angular_mix_alpha: float = 0.0,
+    ensemble_angular_damping: float = 0.9,
+    ensemble_angular_gain: float = 0.2,
+    ensemble_em_refresh_on_horizon_crossing: bool = True,
+    ensemble_em_refresh_on_horizon_leaving: bool = False,
+    ensemble_em_refresh_horizon_ang: float = 15.0,
+    ensemble_em_refresh_min_seq_sep: int = 3,
+    ensemble_em_refresh_on_large_disp: bool = False,
+    ensemble_em_refresh_large_disp_thresh: float = 0.35,
+    ensemble_em_max_extra_directions: int = 24,
     ligand_refine_steps: int = LIGAND_REFINE_STEPS,
     ligand_step_t: float = LIGAND_STEP_T,
     ligand_step_ang: float = LIGAND_STEP_ANG,
+    post_full_heavy_osh: bool = False,
+    post_full_heavy_osh_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, object]:
     """
     Full-chain minimization: minimize E_tot over Cα, then rebuild backbone.
@@ -494,8 +884,35 @@ def minimize_full_chain(
         collective_kink_m: Shell index ``m`` for ``K_multipole``.
         collective_kink_theta_ref_rad: Interior Cα bend reference (rad); default from HQIV α-helix trace.
         collective_kink_use_ss_mask: If True, only apply kink budget at residues predicted ``H`` (``predict_ss``).
+        variational_pair_weight: Weight on Lean ``VariationalScoreTerms`` bounded nonlocal pair proxy
+            (0 = off). Added to fold score as ``w_pair * pair_sum``.
+        variational_pair_epsilon: Per-pair depth parameter ε for bounded pair proxy. Lower bound per pair
+            is ``-ε`` by construction, matching Lean lower-bound assumptions.
+        variational_pair_sigma: LJ-like pair radius scale σ (Å) for bounded pair proxy.
+        variational_pair_dist_cutoff: Pair cutoff (Å) for nonlocal variational pair term.
+        variational_pair_min_seq_sep: Minimum sequence separation |i-j| for pair term.
+        variational_pair_max_pairs: Safety cap on evaluated pair terms.
+        variational_staged_opt: If True and variational pair is enabled, run a staged objective:
+            first optimize with variational pair off, then refine with full variational weight.
+        variational_stage_frac: Fraction of iteration budget used by stage-1 warmup (0..1).
+        variational_bound_prune: If True, use Lean-style lower-bound gating in long-chain fast
+            refinement to skip expensive variational FD gradients when they cannot beat best seen.
+        variational_bound_prune_margin: Safety margin (energy units) for bound gating.
+        inertial_twist_weight: Weight on center-heavy local bend penalty so central twists are
+            penalized more than terminal twists.
+        inertial_twist_theta_ref_rad: Reference local bend angle (rad) for inertial twist term.
+        inertial_twist_exponent: Shape exponent for center-heavy weighting profile.
         ligand_refine_steps, ligand_step_t, ligand_step_ang: Rigid-body refinement of ligands when
             ``include_ligands`` is True (``grad_full`` uses same ``em_scale`` as the backbone; ``hbond_weight`` is forced off).
+        post_full_heavy_osh: If True, run full heavy-atom OSH (:func:`~.osh_oracle_full_atom.minimize_full_heavy_with_osh_oracle`)
+            on top of the minimized Cα trace (portable descent overlay). Updates ``ca_min``, ``backbone_atoms``,
+            sets ``full_heavy_chain`` and ``full_heavy_osh_info``; :func:`full_chain_to_pdb` writes all-atom protein.
+        post_full_heavy_osh_kwargs: Passed to the overlay; may include ``include_sidechain_heavy``, ``energy_kwargs``,
+            ``freeze_ca_positions``, ``limit_ca_displacement_ang``, and any keyword accepted by
+            ``minimize_full_heavy_with_osh_oracle``. By default Cα is **not** frozen so horizon and heavy-atom
+            terms co-minimize with the backbone; ``limit_ca_displacement_ang`` defaults to ~0.22 Å per iteration
+            (unless ``freeze_ca_positions=True``). Pass ``limit_ca_displacement_ang=None`` for no cap.
+            Unknown keys raise ``TypeError``. Default ``energy_kwargs`` inherit ``fast_local_theta`` and ``em_scale``.
 
     Returns:
         dict with:
@@ -506,6 +923,8 @@ def minimize_full_chain(
           info: from minimize_e_tot_lbfgs (e_final, e_initial, n_iter, success, message).
           n_res: number of residues.
           sequence: sequence used.
+          full_heavy_chain: optional :class:`~.full_atom_topology.FullHeavyAtomChain` when ``post_full_heavy_osh`` is True.
+          full_heavy_osh_info: optional dict (accepted steps, stop reason, …) when overlay ran.
     """
     seq = sequence.strip().upper()
     if not seq or not all(c in AA_1to3 for c in seq):
@@ -546,6 +965,18 @@ def minimize_full_chain(
             _e_tot_bind_kw["collective_kink_theta_ref_rad"] = float(collective_kink_theta_ref_rad)
         if collective_kink_ss_mask_np is not None:
             _e_tot_bind_kw["collective_kink_ss_mask"] = collective_kink_ss_mask_np
+    if variational_pair_weight > 0.0:
+        _e_tot_bind_kw["variational_pair_weight"] = float(variational_pair_weight)
+        _e_tot_bind_kw["variational_pair_epsilon"] = float(variational_pair_epsilon)
+        _e_tot_bind_kw["variational_pair_sigma"] = float(variational_pair_sigma)
+        _e_tot_bind_kw["variational_pair_dist_cutoff"] = float(variational_pair_dist_cutoff)
+        _e_tot_bind_kw["variational_pair_min_seq_sep"] = int(variational_pair_min_seq_sep)
+        _e_tot_bind_kw["variational_pair_max_pairs"] = int(variational_pair_max_pairs)
+    if inertial_twist_weight > 0.0:
+        _e_tot_bind_kw["inertial_twist_weight"] = float(inertial_twist_weight)
+        if inertial_twist_theta_ref_rad is not None:
+            _e_tot_bind_kw["inertial_twist_theta_ref_rad"] = float(inertial_twist_theta_ref_rad)
+        _e_tot_bind_kw["inertial_twist_exponent"] = float(inertial_twist_exponent)
 
     if quick:
         include_sidechains = False
@@ -613,6 +1044,18 @@ def minimize_full_chain(
             _gf_kw["collective_kink_theta_ref_rad"] = float(collective_kink_theta_ref_rad)
         if collective_kink_ss_mask_np is not None:
             _gf_kw["collective_kink_ss_mask"] = collective_kink_ss_mask_np
+    if variational_pair_weight > 0.0:
+        _gf_kw["variational_pair_weight"] = float(variational_pair_weight)
+        _gf_kw["variational_pair_epsilon"] = float(variational_pair_epsilon)
+        _gf_kw["variational_pair_sigma"] = float(variational_pair_sigma)
+        _gf_kw["variational_pair_dist_cutoff"] = float(variational_pair_dist_cutoff)
+        _gf_kw["variational_pair_min_seq_sep"] = int(variational_pair_min_seq_sep)
+        _gf_kw["variational_pair_max_pairs"] = int(variational_pair_max_pairs)
+    if inertial_twist_weight > 0.0:
+        _gf_kw["inertial_twist_weight"] = float(inertial_twist_weight)
+        if inertial_twist_theta_ref_rad is not None:
+            _gf_kw["inertial_twist_theta_ref_rad"] = float(inertial_twist_theta_ref_rad)
+        _gf_kw["inertial_twist_exponent"] = float(inertial_twist_exponent)
 
     _e_ca_for_line_search = functools.partial(e_tot_ca_with_bonds, **_e_tot_bind_kw)
 
@@ -652,6 +1095,34 @@ def minimize_full_chain(
         _bond_refine_extras = {
             "grad_full_extra_kwargs": dict(_gf_kw),
             "grad_extra_fn": _grad_extra_opt,
+            "variational_bound_prune": bool(variational_bound_prune),
+            "variational_bound_prune_margin": float(variational_bound_prune_margin),
+            "ensemble_translation_mix_alpha": float(ensemble_translation_mix_alpha),
+            "ensemble_translation_step": float(ensemble_translation_step),
+            "ensemble_decay_span": float(ensemble_decay_span),
+            "ensemble_beta": float(ensemble_beta),
+            "ensemble_s2_power": float(ensemble_s2_power),
+            "ensemble_score_lambda": float(ensemble_score_lambda),
+            "ensemble_inertial_dt": float(ensemble_inertial_dt),
+            "ensemble_linear_damping": float(ensemble_linear_damping),
+            "ensemble_linear_gain": float(ensemble_linear_gain),
+            "ensemble_damping_mode": str(ensemble_damping_mode),
+            "ensemble_barrier_decay": float(ensemble_barrier_decay),
+            "ensemble_barrier_build": float(ensemble_barrier_build),
+            "ensemble_barrier_relief": float(ensemble_barrier_relief),
+            "ensemble_target_transition_only": bool(ensemble_target_transition_only),
+            "ensemble_target_mix_alpha": float(ensemble_target_mix_alpha),
+            "ensemble_target_mix_tolerance": float(ensemble_target_mix_tolerance),
+            "ensemble_angular_mix_alpha": float(ensemble_angular_mix_alpha),
+            "ensemble_angular_damping": float(ensemble_angular_damping),
+            "ensemble_angular_gain": float(ensemble_angular_gain),
+            "ensemble_em_refresh_on_horizon_crossing": bool(ensemble_em_refresh_on_horizon_crossing),
+            "ensemble_em_refresh_on_horizon_leaving": bool(ensemble_em_refresh_on_horizon_leaving),
+            "ensemble_em_refresh_horizon_ang": float(ensemble_em_refresh_horizon_ang),
+            "ensemble_em_refresh_min_seq_sep": int(ensemble_em_refresh_min_seq_sep),
+            "ensemble_em_refresh_on_large_disp": bool(ensemble_em_refresh_on_large_disp),
+            "ensemble_em_refresh_large_disp_thresh": float(ensemble_em_refresh_large_disp_thresh),
+            "ensemble_em_max_extra_directions": int(ensemble_em_max_extra_directions),
         }
 
         # Co-translational ribosome tunnel mode: cone + lip plane, fast-pass spaghetti, connection-triggered HKE
@@ -690,7 +1161,38 @@ def minimize_full_chain(
                 tunnel_thermal_step_size=float(_th_step),
                 tunnel_thermal_quick_cap=bool(quick),
                 tunnel_thermal_seed=_th_seed,
+                tunnel_free_terminus_steps=int(tunnel_free_terminus_steps),
+                tunnel_free_terminus_window=int(tunnel_free_terminus_window),
+                tunnel_handedness_bias_weight=float(tunnel_handedness_bias_weight),
+                tunnel_handedness_target=float(tunnel_handedness_target),
+                tunnel_handedness_sign=float(tunnel_handedness_sign),
                 energy_func_ca=_e_ca_for_line_search,
+                ensemble_translation_mix_alpha=float(ensemble_translation_mix_alpha),
+                ensemble_translation_step=float(ensemble_translation_step),
+                ensemble_decay_span=float(ensemble_decay_span),
+                ensemble_beta=float(ensemble_beta),
+                ensemble_s2_power=float(ensemble_s2_power),
+                ensemble_score_lambda=float(ensemble_score_lambda),
+                ensemble_inertial_dt=float(ensemble_inertial_dt),
+                ensemble_linear_damping=float(ensemble_linear_damping),
+                ensemble_linear_gain=float(ensemble_linear_gain),
+                ensemble_damping_mode=str(ensemble_damping_mode),
+                ensemble_barrier_decay=float(ensemble_barrier_decay),
+                ensemble_barrier_build=float(ensemble_barrier_build),
+                ensemble_barrier_relief=float(ensemble_barrier_relief),
+                ensemble_target_transition_only=bool(ensemble_target_transition_only),
+                ensemble_target_mix_alpha=float(ensemble_target_mix_alpha),
+                ensemble_target_mix_tolerance=float(ensemble_target_mix_tolerance),
+                ensemble_angular_mix_alpha=float(ensemble_angular_mix_alpha),
+                ensemble_angular_damping=float(ensemble_angular_damping),
+                ensemble_angular_gain=float(ensemble_angular_gain),
+                ensemble_em_refresh_on_horizon_crossing=bool(ensemble_em_refresh_on_horizon_crossing),
+                ensemble_em_refresh_on_horizon_leaving=bool(ensemble_em_refresh_on_horizon_leaving),
+                ensemble_em_refresh_horizon_ang=float(ensemble_em_refresh_horizon_ang),
+                ensemble_em_refresh_min_seq_sep=int(ensemble_em_refresh_min_seq_sep),
+                ensemble_em_refresh_on_large_disp=bool(ensemble_em_refresh_on_large_disp),
+                ensemble_em_refresh_large_disp_thresh=float(ensemble_em_refresh_large_disp_thresh),
+                ensemble_em_max_extra_directions=int(ensemble_em_max_extra_directions),
             )
             current_for_dump["ca"] = ca_min.copy()
             # Post-extrusion: default EM 3D field + tree-torque (no grad_full HKE); optional legacy HKE loop.
@@ -781,36 +1283,203 @@ def minimize_full_chain(
         elif n_res > 50:
             def _update_dump_long(_step: int, pos: np.ndarray) -> None:
                 current_for_dump["ca"] = pos.copy()
-            ca_min, info = _minimize_bonds_fast(
-                ca_init,
-                z_ca,
-                max_iter=long_iter,
-                fast_horizon=fast_horizon,
-                collapse=collapse,
-                collapse_frac=0.5,
-                collapse_init_steps=init_steps if collapse else 0,
-                k_rg_collapse=k_rg_collapse,
-                trajectory_log=traj_file,
-                on_step_callback=_update_dump_long if signal_dump_path else None,
-                fast_local_theta=fast_local_theta,
-                **_bond_refine_extras,
-            )
+            staged = bool(variational_staged_opt and variational_pair_weight > 0.0)
+            if staged:
+                frac = float(np.clip(variational_stage_frac, 0.0, 1.0))
+                it1 = max(1, int(long_iter * frac))
+                it2 = max(1, int(long_iter - it1))
+                extras1 = dict(_bond_refine_extras)
+                gkw1 = dict(extras1.get("grad_full_extra_kwargs", {}))
+                gkw1["variational_pair_weight"] = 0.0
+                extras1["grad_full_extra_kwargs"] = gkw1
+                ca_warm, info1 = _minimize_bonds_fast(
+                    ca_init,
+                    z_ca,
+                    max_iter=it1,
+                    fast_horizon=fast_horizon,
+                    collapse=collapse,
+                    collapse_frac=0.5,
+                    collapse_init_steps=init_steps if collapse else 0,
+                    k_rg_collapse=k_rg_collapse,
+                    trajectory_log=traj_file,
+                    on_step_callback=_update_dump_long if signal_dump_path else None,
+                    fast_local_theta=fast_local_theta,
+                    **extras1,
+                )
+                ca_min, info2 = _minimize_bonds_fast(
+                    ca_warm,
+                    z_ca,
+                    max_iter=it2,
+                    fast_horizon=fast_horizon,
+                    collapse=False,
+                    collapse_frac=0.5,
+                    collapse_init_steps=0,
+                    k_rg_collapse=k_rg_collapse,
+                    trajectory_log=traj_file,
+                    on_step_callback=_update_dump_long if signal_dump_path else None,
+                    fast_local_theta=fast_local_theta,
+                    **_bond_refine_extras,
+                )
+                info = dict(info2)
+                info["message"] = "Two-stage variational refine (warmup + full)"
+                info["n_iter"] = int(info1.get("n_iter", 0)) + int(info2.get("n_iter", 0))
+                info["stage1_variational_weight"] = 0.0
+                info["stage2_variational_weight"] = float(variational_pair_weight)
+            else:
+                ca_min, info = _minimize_bonds_fast(
+                    ca_init,
+                    z_ca,
+                    max_iter=long_iter,
+                    fast_horizon=fast_horizon,
+                    collapse=collapse,
+                    collapse_frac=0.5,
+                    collapse_init_steps=init_steps if collapse else 0,
+                    k_rg_collapse=k_rg_collapse,
+                    trajectory_log=traj_file,
+                    on_step_callback=_update_dump_long if signal_dump_path else None,
+                    fast_local_theta=fast_local_theta,
+                    **_bond_refine_extras,
+                )
         else:
             def _traj_cb(step: int, pos: np.ndarray) -> None:
                 write_trajectory_frame(traj_file, step, pos)
-
-            ca_min, info = minimize_e_tot_lbfgs(
-                ca_init,
-                z_ca,
-                max_iter=max_iter,
-                gtol=gtol,
-                energy_func=_e_ca_with_lean if kappa_dihedral > 0 else _e_ca_for_line_search,
-                grad_func=lambda pos, z: _grad_ca_with_lean(pos, z, include_horizon=not fast_horizon),
-                project_bonds=True,
-                r_bond_min=2.5,
-                r_bond_max=6.0,
-                trajectory_callback=_traj_cb if traj_file else None,
-            )
+            staged = bool(variational_staged_opt and variational_pair_weight > 0.0)
+            if staged:
+                frac = float(np.clip(variational_stage_frac, 0.0, 1.0))
+                it1 = max(1, int(max_iter * frac))
+                it2 = max(1, int(max_iter - it1))
+                e_kw1 = dict(_e_tot_bind_kw)
+                g_kw1 = dict(_gf_kw)
+                e_kw1["variational_pair_weight"] = 0.0
+                g_kw1["variational_pair_weight"] = 0.0
+                e1 = functools.partial(e_tot_ca_with_bonds, **e_kw1)
+                ca_warm, info1 = minimize_e_tot_lbfgs(
+                    ca_init,
+                    z_ca,
+                    max_iter=it1,
+                    gtol=gtol,
+                    energy_func=e1,
+                    grad_func=lambda pos, z: grad_full(
+                        pos,
+                        z,
+                        include_bonds=True,
+                        include_horizon=not fast_horizon,
+                        include_clash=True,
+                        **g_kw1,
+                    ),
+                    project_bonds=True,
+                    r_bond_min=2.5,
+                    r_bond_max=6.0,
+                    trajectory_callback=_traj_cb if traj_file else None,
+                    ensemble_translation_mix_alpha=float(ensemble_translation_mix_alpha),
+                    ensemble_translation_step=float(ensemble_translation_step),
+                    ensemble_decay_span=float(ensemble_decay_span),
+                    ensemble_beta=float(ensemble_beta),
+                    ensemble_s2_power=float(ensemble_s2_power),
+                    ensemble_score_lambda=float(ensemble_score_lambda),
+                    ensemble_inertial_dt=float(ensemble_inertial_dt),
+                    ensemble_linear_damping=float(ensemble_linear_damping),
+                    ensemble_linear_gain=float(ensemble_linear_gain),
+                    ensemble_damping_mode=str(ensemble_damping_mode),
+                    ensemble_barrier_decay=float(ensemble_barrier_decay),
+                    ensemble_barrier_build=float(ensemble_barrier_build),
+                    ensemble_barrier_relief=float(ensemble_barrier_relief),
+                    ensemble_target_transition_only=bool(ensemble_target_transition_only),
+                    ensemble_target_mix_alpha=float(ensemble_target_mix_alpha),
+                    ensemble_target_mix_tolerance=float(ensemble_target_mix_tolerance),
+                    ensemble_angular_mix_alpha=float(ensemble_angular_mix_alpha),
+                    ensemble_angular_damping=float(ensemble_angular_damping),
+                    ensemble_angular_gain=float(ensemble_angular_gain),
+                    ensemble_em_refresh_on_horizon_crossing=bool(ensemble_em_refresh_on_horizon_crossing),
+                    ensemble_em_refresh_on_horizon_leaving=bool(ensemble_em_refresh_on_horizon_leaving),
+                    ensemble_em_refresh_horizon_ang=float(ensemble_em_refresh_horizon_ang),
+                    ensemble_em_refresh_min_seq_sep=int(ensemble_em_refresh_min_seq_sep),
+                    ensemble_em_refresh_on_large_disp=bool(ensemble_em_refresh_on_large_disp),
+                    ensemble_em_max_extra_directions=int(ensemble_em_max_extra_directions),
+                    ensemble_large_translation_trigger=float(ensemble_em_refresh_large_disp_thresh),
+                )
+                ca_min, info2 = minimize_e_tot_lbfgs(
+                    ca_warm,
+                    z_ca,
+                    max_iter=it2,
+                    gtol=gtol,
+                    energy_func=_e_ca_with_lean if kappa_dihedral > 0 else _e_ca_for_line_search,
+                    grad_func=lambda pos, z: _grad_ca_with_lean(pos, z, include_horizon=not fast_horizon),
+                    project_bonds=True,
+                    r_bond_min=2.5,
+                    r_bond_max=6.0,
+                    trajectory_callback=_traj_cb if traj_file else None,
+                    ensemble_translation_mix_alpha=float(ensemble_translation_mix_alpha),
+                    ensemble_translation_step=float(ensemble_translation_step),
+                    ensemble_decay_span=float(ensemble_decay_span),
+                    ensemble_beta=float(ensemble_beta),
+                    ensemble_s2_power=float(ensemble_s2_power),
+                    ensemble_score_lambda=float(ensemble_score_lambda),
+                    ensemble_inertial_dt=float(ensemble_inertial_dt),
+                    ensemble_linear_damping=float(ensemble_linear_damping),
+                    ensemble_linear_gain=float(ensemble_linear_gain),
+                    ensemble_damping_mode=str(ensemble_damping_mode),
+                    ensemble_barrier_decay=float(ensemble_barrier_decay),
+                    ensemble_barrier_build=float(ensemble_barrier_build),
+                    ensemble_barrier_relief=float(ensemble_barrier_relief),
+                    ensemble_target_transition_only=bool(ensemble_target_transition_only),
+                    ensemble_target_mix_alpha=float(ensemble_target_mix_alpha),
+                    ensemble_target_mix_tolerance=float(ensemble_target_mix_tolerance),
+                    ensemble_angular_mix_alpha=float(ensemble_angular_mix_alpha),
+                    ensemble_angular_damping=float(ensemble_angular_damping),
+                    ensemble_angular_gain=float(ensemble_angular_gain),
+                    ensemble_em_refresh_on_horizon_crossing=bool(ensemble_em_refresh_on_horizon_crossing),
+                    ensemble_em_refresh_on_horizon_leaving=bool(ensemble_em_refresh_on_horizon_leaving),
+                    ensemble_em_refresh_horizon_ang=float(ensemble_em_refresh_horizon_ang),
+                    ensemble_em_refresh_min_seq_sep=int(ensemble_em_refresh_min_seq_sep),
+                    ensemble_em_refresh_on_large_disp=bool(ensemble_em_refresh_on_large_disp),
+                    ensemble_em_max_extra_directions=int(ensemble_em_max_extra_directions),
+                    ensemble_large_translation_trigger=float(ensemble_em_refresh_large_disp_thresh),
+                )
+                info = dict(info2)
+                info["message"] = "Two-stage variational L-BFGS (warmup + full)"
+                info["n_iter"] = int(info1.get("n_iter", 0)) + int(info2.get("n_iter", 0))
+                info["stage1_variational_weight"] = 0.0
+                info["stage2_variational_weight"] = float(variational_pair_weight)
+            else:
+                ca_min, info = minimize_e_tot_lbfgs(
+                    ca_init,
+                    z_ca,
+                    max_iter=max_iter,
+                    gtol=gtol,
+                    energy_func=_e_ca_with_lean if kappa_dihedral > 0 else _e_ca_for_line_search,
+                    grad_func=lambda pos, z: _grad_ca_with_lean(pos, z, include_horizon=not fast_horizon),
+                    project_bonds=True,
+                    r_bond_min=2.5,
+                    r_bond_max=6.0,
+                    trajectory_callback=_traj_cb if traj_file else None,
+                    ensemble_translation_mix_alpha=float(ensemble_translation_mix_alpha),
+                    ensemble_translation_step=float(ensemble_translation_step),
+                    ensemble_decay_span=float(ensemble_decay_span),
+                    ensemble_beta=float(ensemble_beta),
+                    ensemble_s2_power=float(ensemble_s2_power),
+                    ensemble_score_lambda=float(ensemble_score_lambda),
+                    ensemble_inertial_dt=float(ensemble_inertial_dt),
+                    ensemble_linear_damping=float(ensemble_linear_damping),
+                    ensemble_linear_gain=float(ensemble_linear_gain),
+                    ensemble_damping_mode=str(ensemble_damping_mode),
+                    ensemble_barrier_decay=float(ensemble_barrier_decay),
+                    ensemble_barrier_build=float(ensemble_barrier_build),
+                    ensemble_barrier_relief=float(ensemble_barrier_relief),
+                    ensemble_target_transition_only=bool(ensemble_target_transition_only),
+                    ensemble_target_mix_alpha=float(ensemble_target_mix_alpha),
+                    ensemble_target_mix_tolerance=float(ensemble_target_mix_tolerance),
+                    ensemble_angular_mix_alpha=float(ensemble_angular_mix_alpha),
+                    ensemble_angular_damping=float(ensemble_angular_damping),
+                    ensemble_angular_gain=float(ensemble_angular_gain),
+                    ensemble_em_refresh_on_horizon_crossing=bool(ensemble_em_refresh_on_horizon_crossing),
+                    ensemble_em_refresh_on_horizon_leaving=bool(ensemble_em_refresh_on_horizon_leaving),
+                    ensemble_em_refresh_horizon_ang=float(ensemble_em_refresh_horizon_ang),
+                    ensemble_em_refresh_min_seq_sep=int(ensemble_em_refresh_min_seq_sep),
+                    ensemble_em_refresh_on_large_disp=bool(ensemble_em_refresh_on_large_disp),
+                    ensemble_em_max_extra_directions=int(ensemble_em_max_extra_directions),
+                    ensemble_large_translation_trigger=float(ensemble_em_refresh_large_disp_thresh),
+                )
     finally:
         if traj_file is not None:
             traj_file.close()
@@ -822,6 +1491,28 @@ def minimize_full_chain(
         backbone_atoms = _add_cb(backbone_atoms, seq)
         if side_chain_pack:
             backbone_atoms = _side_chain_pack_light(backbone_atoms, seq)
+
+    post_osh_chain: Optional[object] = None
+    post_osh_info: Optional[Dict[str, Any]] = None
+    if post_full_heavy_osh:
+        pho: Dict[str, object] = {
+            "ca_min": np.asarray(ca_min, dtype=float).copy(),
+            "backbone_atoms": backbone_atoms,
+        }
+        _apply_post_full_heavy_osh(
+            pho,
+            seq,
+            em_scale=float(em_scale),
+            fast_local_theta=bool(fast_local_theta),
+            kwargs=post_full_heavy_osh_kwargs,
+        )
+        ca_min = np.asarray(pho["ca_min"], dtype=float)
+        backbone_atoms = pho["backbone_atoms"]  # type: ignore[assignment]
+        pos_bb, z_bb = _full_backbone_positions_and_z(backbone_atoms)
+        E_ca_final = float(e_tot(ca_min, z_ca))
+        E_backbone_final = float(e_tot(pos_bb, z_bb))
+        post_osh_chain = pho.get("full_heavy_chain")
+        post_osh_info = pho.get("full_heavy_osh_info")  # type: ignore[assignment]
 
     ligand_list: Optional[List[LigandAgent]] = None
     if include_ligands and ligands:
@@ -841,7 +1532,7 @@ def minimize_full_chain(
             grad_full_kwargs=dict(_gf_kw),
         )
 
-    out = {
+    out: Dict[str, Any] = {
         "ca_min": ca_min,
         "backbone_atoms": backbone_atoms,
         "E_ca_final": E_ca_final,
@@ -853,6 +1544,10 @@ def minimize_full_chain(
     }
     if ligand_list is not None:
         out["ligands"] = ligand_list
+    if post_osh_chain is not None:
+        out["full_heavy_chain"] = post_osh_chain
+    if post_osh_info is not None:
+        out["full_heavy_osh_info"] = post_osh_info
     return out
 
 
@@ -1195,13 +1890,30 @@ def full_chain_to_pdb(
     ligand_chain_id: Optional[str] = None,
 ) -> str:
     """Format minimizer result as PDB string (MODEL 1 ... ENDMDL END). Protein ATOM records then ligand HETATM if ligands provided."""
+    fhc = result.get("full_heavy_chain")
     backbone_atoms = result["backbone_atoms"]
     sequence = result["sequence"]
     include_sidechains = result.get("include_sidechains", False)
     if ligands is None:
         ligands = result.get("ligands") or []
-    if not backbone_atoms and not ligands:
+    if not backbone_atoms and not ligands and fhc is None:
         return "MODEL     1\nENDMDL\nEND\n"
+    if fhc is not None:
+        from .full_atom_topology import chain_to_pdb_line_string
+
+        if not ligands:
+            return chain_to_pdb_line_string(fhc, chain_id=chain_id)
+        base_lines = [
+            ln for ln in chain_to_pdb_line_string(fhc, chain_id=chain_id).split("\n") if ln.strip()
+        ]
+        while base_lines and base_lines[-1].strip() in ("END", "ENDMDL"):
+            base_lines.pop()
+        start_id = int(fhc.positions.shape[0]) + 1
+        het_chain = ligand_chain_id if ligand_chain_id is not None else chain_id
+        het_lines, _ = pdb_hetatm_lines_for_ligands(
+            list(ligands), start_atom_id=start_id, ligand_chain_id=het_chain
+        )
+        return "\n".join(base_lines + het_lines + ["ENDMDL", "END"])
     het_chain = ligand_chain_id if ligand_chain_id is not None else chain_id
     lines = ["MODEL     1"]
     atom_id = 1

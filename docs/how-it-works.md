@@ -8,6 +8,7 @@
 4. **Co-translational path** — ribosome tunnel masking, segment scheduling, extrusion, then post-tunnel refinement (`co_translational_tunnel.py`, `lean_ribosome_tunnel_pipeline.py`).
 5. **Hierarchical / JAX** — optional tree-structured minimization for large chains (`hierarchical/`).
 6. **Assembly** — multi-chain docking after per-chain folds (`assembly_dock.py`).
+7. **OSHoracle sparse refinement (optional)** — sparse support is expanded horizon-causally (`i -> i and i+1`), gate-evolved in a dense reconstruction, then only changed-support residues are updated in CA minimization (`osh_oracle_folding.py`, `pipeline_interchange.py`).
 
 ## Lean parity
 

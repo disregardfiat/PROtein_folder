@@ -93,6 +93,19 @@ def fold_lean_ribosome_tunnel(
     collective_kink_m: int = 3,
     collective_kink_theta_ref_rad: Optional[float] = None,
     collective_kink_use_ss_mask: bool = False,
+    variational_pair_weight: float = 0.0,
+    variational_pair_epsilon: float = 0.1,
+    variational_pair_sigma: float = 4.0,
+    variational_pair_dist_cutoff: float = 12.0,
+    variational_pair_min_seq_sep: int = 3,
+    variational_pair_max_pairs: int = 400,
+    variational_staged_opt: bool = False,
+    variational_stage_frac: float = 0.5,
+    variational_bound_prune: bool = False,
+    variational_bound_prune_margin: float = 0.0,
+    inertial_twist_weight: float = 0.0,
+    inertial_twist_theta_ref_rad: Optional[float] = None,
+    inertial_twist_exponent: float = 1.0,
     include_ligands: bool = False,
     ligands: Optional[List[LigandAgent]] = None,
     ligand_str: Optional[str] = None,
@@ -101,6 +114,8 @@ def fold_lean_ribosome_tunnel(
     ligand_step_t: Optional[float] = None,
     ligand_step_ang: Optional[float] = None,
     ligand_chain_id: Optional[str] = None,
+    post_full_heavy_osh: bool = False,
+    post_full_heavy_osh_kwargs: Optional[Dict[str, Any]] = None,
 ) -> LeanTunnelFoldResult:
     """
     Fold a sequence with the ribosome tunnel and Lean-aligned solvent / dihedral physics.
@@ -115,7 +130,13 @@ def fold_lean_ribosome_tunnel(
     - **Long-range proxy (Lean ``HQIVLongRange``):** optional ``hbond_weight`` / ``hbond_shell_m`` → ``grad_full`` additive ``hBondProxy`` term (costly).
     - **Performance flags:** ``fast_local_theta`` (batched Θ_i in ``e_tot_ca_with_bonds``); ``horizon_neighbor_cutoff`` (tighter horizon neighbor list in Å).
     - **Collective kink (``HQIVCollectiveModes``):** ``collective_kink_weight`` / ``collective_kink_m`` / optional ``theta_ref`` / ``collective_kink_use_ss_mask``.
+    - **Variational score terms (``VariationalScoreTerms``):** ``variational_pair_weight`` and related
+      pair-shape parameters; optional staged optimization (``variational_staged_opt``) and Lean-style
+      lower-bound gradient gating (``variational_bound_prune``).
+    - **Inertial twist penalty:** ``inertial_twist_weight`` to penalize central bends more than
+      terminal bends (center-heavy chain inertia proxy).
     - **Ligands:** pass ``ligands``, or ``ligand_str`` (PDB block / SMILES lines), or ``ligand_file``; set ``include_ligands=True``. Rigid-body refinement uses the same ``em_scale`` as the protein; optional ``ligand_chain_id`` (e.g. ``\"L\"``) for HETATM chain column (default: same as protein chain ``A``).
+    - **Full heavy OSH overlay:** ``post_full_heavy_osh=True`` runs sparse full heavy-atom refinement after the fast path (same as ``minimize_full_chain``); ``post_full_heavy_osh_kwargs`` forwarded. PDB from ``full_chain_to_pdb`` includes side-chain heavy atoms when set.
     """
     seq = "".join(c for c in sequence.strip().upper() if c.isalpha())
     if not seq:
@@ -184,8 +205,23 @@ def fold_lean_ribosome_tunnel(
         collective_kink_m=collective_kink_m,
         collective_kink_theta_ref_rad=collective_kink_theta_ref_rad,
         collective_kink_use_ss_mask=collective_kink_use_ss_mask,
+        variational_pair_weight=variational_pair_weight,
+        variational_pair_epsilon=variational_pair_epsilon,
+        variational_pair_sigma=variational_pair_sigma,
+        variational_pair_dist_cutoff=variational_pair_dist_cutoff,
+        variational_pair_min_seq_sep=variational_pair_min_seq_sep,
+        variational_pair_max_pairs=variational_pair_max_pairs,
+        variational_staged_opt=variational_staged_opt,
+        variational_stage_frac=variational_stage_frac,
+        variational_bound_prune=variational_bound_prune,
+        variational_bound_prune_margin=variational_bound_prune_margin,
+        inertial_twist_weight=inertial_twist_weight,
+        inertial_twist_theta_ref_rad=inertial_twist_theta_ref_rad,
+        inertial_twist_exponent=inertial_twist_exponent,
         include_ligands=use_lig,
         ligands=lig_list if use_lig else None,
+        post_full_heavy_osh=bool(post_full_heavy_osh),
+        post_full_heavy_osh_kwargs=post_full_heavy_osh_kwargs,
         **lig_kw,
     )
     het_chain = ligand_chain_id if use_lig else None
