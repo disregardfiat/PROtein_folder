@@ -78,6 +78,12 @@ def fold_lean_ribosome_tunnel(
     quick: bool = False,
     post_extrusion_max_disp_floor: float = 0.25,
     post_extrusion_max_rounds: int = 32,
+    post_extrusion_osh_hqiv_native: bool = False,
+    post_extrusion_osh_n_iter: int = 120,
+    post_extrusion_osh_step_size: float = 0.03,
+    post_extrusion_osh_ansatz_depth: int = 2,
+    post_extrusion_osh_gate_mix: float = 0.55,
+    post_extrusion_osh_hqiv_reference_m: int = 4,
     fast_pass_steps_per_connection: int = 0,
     min_pass_iter_per_connection: int = 0,
     tunnel_thermal_gradient_steps: int = 0,
@@ -113,9 +119,10 @@ def fold_lean_ribosome_tunnel(
     ligand_refine_steps: Optional[int] = None,
     ligand_step_t: Optional[float] = None,
     ligand_step_ang: Optional[float] = None,
+    ligand_refinement_mode: str = "lean_qc",
+    qc_soft_clash_sigma: float = 3.0,
+    qc_clash_weight: float = 1.0,
     ligand_chain_id: Optional[str] = None,
-    post_full_heavy_osh: bool = False,
-    post_full_heavy_osh_kwargs: Optional[Dict[str, Any]] = None,
 ) -> LeanTunnelFoldResult:
     """
     Fold a sequence with the ribosome tunnel and Lean-aligned solvent / dihedral physics.
@@ -136,7 +143,6 @@ def fold_lean_ribosome_tunnel(
     - **Inertial twist penalty:** ``inertial_twist_weight`` to penalize central bends more than
       terminal bends (center-heavy chain inertia proxy).
     - **Ligands:** pass ``ligands``, or ``ligand_str`` (PDB block / SMILES lines), or ``ligand_file``; set ``include_ligands=True``. Rigid-body refinement uses the same ``em_scale`` as the protein; optional ``ligand_chain_id`` (e.g. ``\"L\"``) for HETATM chain column (default: same as protein chain ``A``).
-    - **Full heavy OSH overlay:** ``post_full_heavy_osh=True`` runs sparse full heavy-atom refinement after the fast path (same as ``minimize_full_chain``); ``post_full_heavy_osh_kwargs`` forwarded. PDB from ``full_chain_to_pdb`` includes side-chain heavy atoms when set.
     """
     seq = "".join(c for c in sequence.strip().upper() if c.isalpha())
     if not seq:
@@ -163,6 +169,9 @@ def fold_lean_ribosome_tunnel(
         lig_kw["ligand_step_t"] = float(ligand_step_t)
     if ligand_step_ang is not None:
         lig_kw["ligand_step_ang"] = float(ligand_step_ang)
+    lig_kw["ligand_refinement_mode"] = str(ligand_refinement_mode)
+    lig_kw["qc_soft_clash_sigma"] = float(qc_soft_clash_sigma)
+    lig_kw["qc_clash_weight"] = float(qc_clash_weight)
 
     raw = minimize_full_chain(
         seq,
@@ -190,6 +199,12 @@ def fold_lean_ribosome_tunnel(
         quick=quick,
         post_extrusion_max_disp_floor=post_extrusion_max_disp_floor,
         post_extrusion_max_rounds=post_extrusion_max_rounds,
+        post_extrusion_osh_hqiv_native=post_extrusion_osh_hqiv_native,
+        post_extrusion_osh_n_iter=post_extrusion_osh_n_iter,
+        post_extrusion_osh_step_size=post_extrusion_osh_step_size,
+        post_extrusion_osh_ansatz_depth=post_extrusion_osh_ansatz_depth,
+        post_extrusion_osh_gate_mix=post_extrusion_osh_gate_mix,
+        post_extrusion_osh_hqiv_reference_m=post_extrusion_osh_hqiv_reference_m,
         fast_pass_steps_per_connection=fast_pass_steps_per_connection,
         min_pass_iter_per_connection=min_pass_iter_per_connection,
         tunnel_thermal_gradient_steps=tunnel_thermal_gradient_steps,
@@ -220,8 +235,6 @@ def fold_lean_ribosome_tunnel(
         inertial_twist_exponent=inertial_twist_exponent,
         include_ligands=use_lig,
         ligands=lig_list if use_lig else None,
-        post_full_heavy_osh=bool(post_full_heavy_osh),
-        post_full_heavy_osh_kwargs=post_full_heavy_osh_kwargs,
         **lig_kw,
     )
     het_chain = ligand_chain_id if use_lig else None

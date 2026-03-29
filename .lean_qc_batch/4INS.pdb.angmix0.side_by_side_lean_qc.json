@@ -1,0 +1,48 @@
+{
+  "n_residues": 102,
+  "z_shell": 6,
+  "lean_reference_m": 4,
+  "eta_mode_phi": 0.03333333333333333,
+  "ang_mix": 0.0,
+  "objective": "e_tot_ca_with_bonds + projected C\u03b1 bond constraints",
+  "site_energy_trace_ev": 39984.0,
+  "lean_references": {
+    "quantum_chemistry_contract": "Hqiv/ProteinResearch/ProteinFoldingQuantumChemistry.lean",
+    "site_matrix_bridge": "Hqiv/ProteinResearch/AtomEnergyOSHoracleBridge.lean",
+    "natural_update": "Hqiv/ProteinResearch/ProteinNaturalFolding.lean",
+    "hke_minimizer_spec": "Hqiv/ProteinResearch/ProteinHKEMinimizer.lean"
+  },
+  "energy_kwargs": {},
+  "ensure_progress": true,
+  "max_restarts": 4,
+  "restart_jitter_sigma_ang": 0.75,
+  "same_minimum_thresholds": {
+    "energy_tol_ev": 0.001,
+    "rmsd_tol_ang": 0.05
+  },
+  "traditional": {
+    "method": "traditional_gradient_descent",
+    "wall_seconds": 29.268367585988017,
+    "initial_energy_ev": 349599895.523385,
+    "final_energy_ev": 300555.3292665236,
+    "energy_drop_ev": 349299340.19411844,
+    "n_steps": 250,
+    "stop_reason": "accepted_steps=187; restart_used=0"
+  },
+  "lean_natural_disp": {
+    "method": "lean_natural_disp",
+    "wall_seconds": 38.685777568025514,
+    "initial_energy_ev": 349599895.523385,
+    "final_energy_ev": 4439210.145341245,
+    "energy_drop_ev": 345160685.3780438,
+    "n_steps": 250,
+    "stop_reason": "accepted_steps=5; restart_used=0; eta_mode_phi=0.033333333; ang_mix=0; reference_m=4"
+  },
+  "agreement": {
+    "final_energy_delta_ev": 4138654.816074722,
+    "final_ca_rmsd_ang_aligned": 19.10594449726228,
+    "same_minimum": false
+  },
+  "target_pdb": "/home/jr/Repos/PROtien/proteins/4INS.pdb",
+  "init_noise_sigma_ang": 0.0
+}

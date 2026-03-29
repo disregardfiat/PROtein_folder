@@ -975,57 +975,6 @@ def bonded_set_from_edges(edges: List[Tuple[int, int, float]]) -> Set[Tuple[int,
     return out
 
 
-def e_polymer_bond_penalty(
-    positions: np.ndarray,
-    edges: List[Tuple[int, int, float]],
-    *,
-    r_min: float = R_BOND_MIN,
-    r_max: float = R_BOND_MAX,
-    k_bond: float = K_BOND,
-) -> float:
-    """Total bond-stretch penalty for an arbitrary covalent edge list (i, j, r_eq)."""
-    pos = np.asarray(positions, dtype=float)
-    e = 0.0
-    n_atom = int(pos.shape[0])
-    for i, j, r_eq in edges:
-        if int(i) >= n_atom or int(j) >= n_atom:
-            continue
-        r = float(np.linalg.norm(pos[int(j)] - pos[int(i)]))
-        e += _bond_stretch_energy_scalar(
-            r, float(r_eq), float(r_min), float(r_max), float(k_bond)
-        )
-    return float(e)
-
-
-def grad_polymer_bonds_only(
-    positions: np.ndarray,
-    edges: List[Tuple[int, int, float]],
-    *,
-    r_min: float = R_BOND_MIN,
-    r_max: float = R_BOND_MAX,
-    k_bond: float = K_BOND,
-    n_atom: Optional[int] = None,
-) -> np.ndarray:
-    """Gradient of ``e_polymer_bond_penalty`` w.r.t. all atom positions."""
-    pos = np.asarray(positions, dtype=float)
-    na = int(pos.shape[0]) if n_atom is None else int(n_atom)
-    grad = np.zeros_like(pos)
-    for i, j, r_eq in edges:
-        ia, jb = int(i), int(j)
-        if ia >= na or jb >= na:
-            continue
-        d = pos[jb] - pos[ia]
-        r = float(np.linalg.norm(d))
-        if r < 1e-12:
-            continue
-        u = d / r
-        g = _bond_stretch_force_scalar(r, float(r_eq), float(r_min), float(r_max), float(k_bond))
-        vec = g * u
-        grad[ia] -= vec
-        grad[jb] += vec
-    return grad
-
-
 def grad_backbone_bonds_only(
     positions: np.ndarray,
     n_res: int,
@@ -1038,9 +987,20 @@ def grad_backbone_bonds_only(
     pos = np.asarray(positions, dtype=float)
     n_atom = int(pos.shape[0])
     edges = backbone_bond_edges(n_res)
-    return grad_polymer_bonds_only(
-        pos, edges, r_min=r_min, r_max=r_max, k_bond=k_bond, n_atom=n_atom
-    )
+    grad = np.zeros_like(pos)
+    for i, j, r_eq in edges:
+        if i >= n_atom or j >= n_atom:
+            continue
+        d = pos[j] - pos[i]
+        r = float(np.linalg.norm(d))
+        if r < 1e-12:
+            continue
+        u = d / r
+        g = _bond_stretch_force_scalar(r, float(r_eq), float(r_min), float(r_max), float(k_bond))
+        vec = g * u
+        grad[i] -= vec
+        grad[j] += vec
+    return grad
 
 
 def e_backbone_bond_penalty(
@@ -1051,13 +1011,14 @@ def e_backbone_bond_penalty(
     r_max: float = R_BOND_MAX,
     k_bond: float = K_BOND,
 ) -> float:
-    return e_polymer_bond_penalty(
-        positions,
-        backbone_bond_edges(n_res),
-        r_min=r_min,
-        r_max=r_max,
-        k_bond=k_bond,
-    )
+    pos = np.asarray(positions, dtype=float)
+    e = 0.0
+    for i, j, r_eq in backbone_bond_edges(n_res):
+        if i >= pos.shape[0] or j >= pos.shape[0]:
+            continue
+        r = float(np.linalg.norm(pos[j] - pos[i]))
+        e += _bond_stretch_energy_scalar(r, float(r_eq), float(r_min), float(r_max), float(k_bond))
+    return float(e)
 
 
 def e_clash_nonbonded(
@@ -1109,82 +1070,6 @@ def grad_clash_nonbonded(
     return grad
 
 
-def e_ca_target_restraint(
-    positions: np.ndarray,
-    n_res: int,
-    ca_target: np.ndarray,
-    k_ca_target: float,
-) -> float:
-    """Harmonic penalty on Cα positions vs ``ca_target`` (shape ``(n_res, 3)``)."""
-    if float(k_ca_target) <= 0.0:
-        return 0.0
-    pos = np.asarray(positions, dtype=float)
-    tgt = np.asarray(ca_target, dtype=float).reshape(int(n_res), 3)
-    k = float(k_ca_target)
-    e = 0.0
-    for i in range(int(n_res)):
-        d = pos[4 * i + 1] - tgt[i]
-        e += k * float(np.dot(d, d))
-    return float(e)
-
-
-def grad_ca_target_restraint(
-    positions: np.ndarray,
-    n_res: int,
-    ca_target: np.ndarray,
-    k_ca_target: float,
-) -> np.ndarray:
-    pos = np.asarray(positions, dtype=float)
-    grad = np.zeros_like(pos)
-    if float(k_ca_target) <= 0.0:
-        return grad
-    tgt = np.asarray(ca_target, dtype=float).reshape(int(n_res), 3)
-    c = 2.0 * float(k_ca_target)
-    for i in range(int(n_res)):
-        grad[4 * i + 1] += c * (pos[4 * i + 1] - tgt[i])
-    return grad
-
-
-def e_ca_target_restraint_atom_indices(
-    positions: np.ndarray,
-    ca_atom_indices: np.ndarray,
-    ca_target: np.ndarray,
-    k_ca_target: float,
-) -> float:
-    """Cα anchoring for arbitrary layouts; ``ca_atom_indices`` maps residue → global atom index."""
-    if float(k_ca_target) <= 0.0:
-        return 0.0
-    pos = np.asarray(positions, dtype=float)
-    idx = np.asarray(ca_atom_indices, dtype=int).reshape(-1)
-    tgt = np.asarray(ca_target, dtype=float).reshape(-1, 3)
-    if idx.size != tgt.shape[0]:
-        raise ValueError("ca_atom_indices and ca_target have incompatible shapes")
-    k = float(k_ca_target)
-    e = 0.0
-    for row, ia in enumerate(idx.tolist()):
-        d = pos[int(ia)] - tgt[row]
-        e += k * float(np.dot(d, d))
-    return float(e)
-
-
-def grad_ca_target_restraint_atom_indices(
-    positions: np.ndarray,
-    ca_atom_indices: np.ndarray,
-    ca_target: np.ndarray,
-    k_ca_target: float,
-) -> np.ndarray:
-    pos = np.asarray(positions, dtype=float)
-    grad = np.zeros_like(pos)
-    if float(k_ca_target) <= 0.0:
-        return grad
-    idx = np.asarray(ca_atom_indices, dtype=int).reshape(-1)
-    tgt = np.asarray(ca_target, dtype=float).reshape(-1, 3)
-    c = 2.0 * float(k_ca_target)
-    for row, ia in enumerate(idx.tolist()):
-        grad[int(ia)] += c * (pos[int(ia)] - tgt[row])
-    return grad
-
-
 def e_tot_backbone_with_bonds(
     positions: np.ndarray,
     z_list: np.ndarray,
@@ -1197,16 +1082,11 @@ def e_tot_backbone_with_bonds(
     r_clash: float = R_CLASH,
     k_clash: float = K_CLASH,
     include_clash: bool = True,
-    ca_target: Optional[np.ndarray] = None,
-    k_ca_target: float = 0.0,
 ) -> float:
     """
     ``e_tot`` + backbone covalent penalties + all-atom clash for non-bonded pairs.
 
     ``positions`` must be (4 * n_res, 3) in order (N, CA, C, O) per residue.
-
-    Optional ``ca_target`` + ``k_ca_target`` add a Cα anchoring term (e.g. hold fold
-    while refining N, C, O and local geometry).
     """
     e = float(e_tot(positions, z_list, fast_local_theta=fast_local_theta))
     e += e_backbone_bond_penalty(
@@ -1215,8 +1095,6 @@ def e_tot_backbone_with_bonds(
     if include_clash:
         bonded = bonded_set_from_edges(backbone_bond_edges(n_res))
         e += e_clash_nonbonded(positions, bonded, r_clash=r_clash, k_clash=k_clash)
-    if ca_target is not None and float(k_ca_target) > 0.0:
-        e += e_ca_target_restraint(positions, n_res, ca_target, k_ca_target)
     return float(e)
 
 
@@ -1233,8 +1111,6 @@ def grad_full_backbone(
     k_bond: float = K_BOND,
     r_clash: float = R_CLASH,
     k_clash: float = K_CLASH,
-    ca_target: Optional[np.ndarray] = None,
-    k_ca_target: float = 0.0,
     **kwargs: Any,
 ) -> np.ndarray:
     """
@@ -1257,223 +1133,7 @@ def grad_full_backbone(
     if include_clash:
         bonded = bonded_set_from_edges(backbone_bond_edges(n_res))
         grad += grad_clash_nonbonded(pos, bonded, r_clash=r_clash, k_clash=k_clash)
-    if ca_target is not None and float(k_ca_target) > 0.0:
-        grad += grad_ca_target_restraint(pos, n_res, ca_target, k_ca_target)
     return grad
-
-
-def e_tot_polymer_with_bonds(
-    positions: np.ndarray,
-    z_list: np.ndarray,
-    bond_edges: List[Tuple[int, int, float]],
-    *,
-    fast_local_theta: bool = False,
-    r_bond_min: float = R_BOND_MIN,
-    r_bond_max: float = R_BOND_MAX,
-    k_bond: float = K_BOND,
-    r_clash: float = R_CLASH,
-    k_clash: float = K_CLASH,
-    include_clash: bool = True,
-    ca_atom_indices: Optional[np.ndarray] = None,
-    ca_target: Optional[np.ndarray] = None,
-    k_ca_target: float = 0.0,
-) -> float:
-    """
-    HQIV ``e_tot`` + arbitrary polymer bond list + clash (+ optional Cα anchoring by index).
-
-    Use with :mod:`horizon_physics.proteins.full_atom_topology.FullAtomChain`.
-    """
-    e = float(e_tot(positions, z_list, fast_local_theta=fast_local_theta))
-    e += e_polymer_bond_penalty(
-        positions,
-        bond_edges,
-        r_min=r_bond_min,
-        r_max=r_bond_max,
-        k_bond=k_bond,
-    )
-    if include_clash:
-        bonded = bonded_set_from_edges(bond_edges)
-        e += e_clash_nonbonded(positions, bonded, r_clash=r_clash, k_clash=k_clash)
-    if (
-        ca_target is not None
-        and ca_atom_indices is not None
-        and float(k_ca_target) > 0.0
-    ):
-        e += e_ca_target_restraint_atom_indices(
-            positions, ca_atom_indices, ca_target, k_ca_target
-        )
-    return float(e)
-
-
-def full_atom_polymer_energy_budget(
-    positions: np.ndarray,
-    z_list: np.ndarray,
-    bond_edges: List[Tuple[int, int, float]],
-    *,
-    fast_local_theta: bool = False,
-    r_bond_min: float = R_BOND_MIN,
-    r_bond_max: float = R_BOND_MAX,
-    k_bond: float = K_BOND,
-    r_clash: float = R_CLASH,
-    k_clash: float = K_CLASH,
-    include_clash: bool = True,
-    ca_atom_indices: Optional[np.ndarray] = None,
-    ca_target: Optional[np.ndarray] = None,
-    k_ca_target: float = 0.0,
-    r_ref: float = 2.0,
-    r_horizon: float = R_HORIZON,
-    k_horizon: float = 0.5 * HBAR_C_EV_ANG,
-    use_neighbor_list: bool = USE_NEIGHBOR_LIST,
-    em_scale: float = 1.0,
-    neighbor_cutoff: Optional[float] = None,
-) -> Dict[str, float]:
-    """
-    Decompose the same scalar pieces as :func:`e_tot_polymer_with_bonds`, plus a horizon diagnostic.
-
-    **Minimizer parity:** ``e_objective_ev`` equals ``e_tot_polymer_with_bonds(...)`` with the same
-    kwargs — this is what ``osh_oracle_full_atom`` uses for accept/reject energy.
-
-    **Gradient note:** :func:`grad_full_polymer` also adds pairwise EM horizon *forces* from
-    :func:`build_horizon_poles`; those are not folded into ``e_objective_ev``. For feedback loops
-    (e.g. driving Cα OSH), use ``e_horizon_em_pole_magnitude_sum_ev`` = Σ‖pole_vector‖ (same poles as
-    the gradient builder) as a scalar stress proxy alongside the objective.
-    """
-    pos = np.asarray(positions, dtype=float)
-    z = np.asarray(z_list, dtype=float)
-    e_info = float(e_tot_informational(pos, z, fast_local_theta=fast_local_theta))
-    e_damp_raw = float(e_tot_damping(pos, z, fast_local_theta=fast_local_theta))
-    lambda_damp = 0.1 * HBAR_C_EV_ANG
-    e_damp_w = float(lambda_damp * e_damp_raw)
-    e_atomic = float(e_info + e_damp_w)
-    e_bond = float(
-        e_polymer_bond_penalty(
-            pos,
-            bond_edges,
-            r_min=r_bond_min,
-            r_max=r_bond_max,
-            k_bond=k_bond,
-        )
-    )
-    e_clash_v = 0.0
-    if include_clash:
-        bonded = bonded_set_from_edges(bond_edges)
-        e_clash_v = float(e_clash_nonbonded(pos, bonded, r_clash=r_clash, k_clash=k_clash))
-    e_ca = 0.0
-    if (
-        ca_target is not None
-        and ca_atom_indices is not None
-        and float(k_ca_target) > 0.0
-    ):
-        e_ca = float(
-            e_ca_target_restraint_atom_indices(
-                pos,
-                np.asarray(ca_atom_indices, dtype=int),
-                ca_target,
-                k_ca_target,
-            )
-        )
-    poles = build_horizon_poles(
-        pos,
-        np.asarray(z, dtype=np.int32),
-        r_ref=r_ref,
-        r_horizon=r_horizon,
-        k_horizon=k_horizon,
-        use_neighbor_list=use_neighbor_list,
-        em_scale=em_scale,
-        neighbor_cutoff=neighbor_cutoff,
-    )
-    pole_mag_sum = float(sum(float(np.linalg.norm(p[2])) for p in poles))
-    e_obj = float(e_atomic + e_bond + e_clash_v + e_ca)
-    return {
-        "e_informational_ev": e_info,
-        "e_damping_unweighted_ev": e_damp_raw,
-        "e_damping_weighted_ev": e_damp_w,
-        "e_atomic_subtotal_ev": e_atomic,
-        "e_bond_penalty_ev": e_bond,
-        "e_clash_ev": e_clash_v,
-        "e_ca_target_ev": e_ca,
-        "e_objective_ev": e_obj,
-        "e_horizon_em_pole_magnitude_sum_ev": pole_mag_sum,
-        "n_horizon_poles": float(len(poles)),
-    }
-
-
-def grad_full_polymer(
-    positions: np.ndarray,
-    z_list: np.ndarray,
-    bond_edges: List[Tuple[int, int, float]],
-    *,
-    include_bonds: bool = True,
-    include_horizon: bool = True,
-    include_clash: bool = True,
-    r_bond_min: float = R_BOND_MIN,
-    r_bond_max: float = R_BOND_MAX,
-    k_bond: float = K_BOND,
-    r_clash: float = R_CLASH,
-    k_clash: float = K_CLASH,
-    ca_atom_indices: Optional[np.ndarray] = None,
-    ca_target: Optional[np.ndarray] = None,
-    k_ca_target: float = 0.0,
-    **kwargs: Any,
-) -> np.ndarray:
-    """Gradient for ``e_tot_polymer_with_bonds`` (same optional pieces as ``grad_full_backbone``)."""
-    pos = np.asarray(positions, dtype=float)
-    grad = np.zeros_like(pos)
-    if include_bonds:
-        grad += grad_polymer_bonds_only(
-            pos,
-            bond_edges,
-            r_min=r_bond_min,
-            r_max=r_bond_max,
-            k_bond=k_bond,
-        )
-    if include_horizon:
-        grad += grad_horizon_full(
-            pos,
-            z_list,
-            **{k: v for k, v in kwargs.items() if k in ("r_ref", "r_horizon", "k_horizon", "em_scale", "use_neighbor_list", "neighbor_cutoff")},
-        )
-    if include_clash:
-        bonded = bonded_set_from_edges(bond_edges)
-        grad += grad_clash_nonbonded(pos, bonded, r_clash=r_clash, k_clash=k_clash)
-    if (
-        ca_target is not None
-        and ca_atom_indices is not None
-        and float(k_ca_target) > 0.0
-    ):
-        grad += grad_ca_target_restraint_atom_indices(
-            pos, ca_atom_indices, ca_target, k_ca_target
-        )
-    return grad
-
-
-def project_polymer_covalent_bonds(
-    positions: np.ndarray,
-    edges: List[Tuple[int, int, float]],
-    *,
-    r_min: float = R_BOND_MIN,
-    r_max: float = R_BOND_MAX,
-    passes: int = 3,
-) -> np.ndarray:
-    """Half-step length projection on each covalent edge (same scheme as backbone)."""
-    pos = np.asarray(positions, dtype=float).copy()
-    for _ in range(max(1, int(passes))):
-        for i, j, _ in edges:
-            d = pos[j] - pos[i]
-            r = float(np.linalg.norm(d))
-            if r < 1e-12:
-                continue
-            u = d / r
-            if r < float(r_min):
-                tgt = float(r_min)
-            elif r > float(r_max):
-                tgt = float(r_max)
-            else:
-                continue
-            delta = 0.5 * (r - tgt) * u
-            pos[i] += delta
-            pos[j] -= delta
-    return pos
 
 
 def project_backbone_covalent_bonds(

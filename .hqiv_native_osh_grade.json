@@ -1,0 +1,33 @@
+{
+  "runs": [
+    {
+      "target_pdb": "/home/jr/Repos/PROtien/proteins/1CRN.pdb",
+      "gold_pdb": "/home/jr/Repos/PROtien/proteins/1CRN.pdb",
+      "n_res": 46,
+      "z_shell": 6,
+      "hqiv_reference_m": 4,
+      "hqiv_pivot_mod_L_plus_1": 45,
+      "n_iter": 100,
+      "final_energy_ev": 70229.45729488689,
+      "accepted_steps": 1,
+      "stop_reason": "max_iter_reached",
+      "wall_seconds": 1.849021403992083,
+      "ca_rmsd_ang": 0.04949659938184116
+    },
+    {
+      "target_pdb": "/home/jr/Repos/PROtien/proteins/1VII.pdb",
+      "gold_pdb": "/home/jr/Repos/PROtien/proteins/1VII.pdb",
+      "n_res": 36,
+      "z_shell": 6,
+      "hqiv_reference_m": 4,
+      "hqiv_pivot_mod_L_plus_1": 35,
+      "n_iter": 100,
+      "final_energy_ev": 54638.37123208868,
+      "accepted_steps": 1,
+      "stop_reason": "max_iter_reached",
+      "wall_seconds": 1.4500344010011759,
+      "ca_rmsd_ang": 0.04514756983152033
+    }
+  ],
+  "lean_module": "Hqiv/QuantumComputing/OSHoracleHQIVNative.lean"
+}

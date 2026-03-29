@@ -17,25 +17,45 @@ contacts. A multi-atom model would reuse the same sparse primitives with a
 different state layout (e.g. flat atom list or residue × atom blocks), energy
 and gradient callables, and geometry projection appropriate to that graph.
 
+**HQIV-native digital gate** (Lean ``Hqiv/QuantumComputing/OSHoracleHQIVNative.lean`` /
+``ProteinFoldingHook.lean``): optional ``apply_gate_sparse_hqiv_native`` uses
+``hqivPivotFromShells`` = ``(Σ shells + referenceM) % (L+1)``, ``HarmonicIndex`` slot
+``ℓ = pivot mod (L+1)``, ``m = 0``, and a π phase (sign flip) on that mode — same
+sparse pipeline cost as ``applyGateSparse`` in Lean.
+
 Heavy-atom backbone (N, CA, C, O) with the same sparse register logic:
 ``horizon_physics.proteins.osh_oracle_backbone.minimize_backbone_with_osh_oracle``.
-
-Variable block sizes (full heavy side chains, covalent graph from topology):
-``horizon_physics.proteins.osh_oracle_full_atom.minimize_full_heavy_with_osh_oracle``.
 """
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
 
-from .folding_energy import e_tot_ca_with_bonds, grad_full
+from .folding_energy import (
+    count_nonlocal_pairs_entering_horizon,
+    e_tot_ca_with_bonds,
+    grad_full,
+)
 from .gradient_descent_folding import _project_bonds
+from .horizon_qed_bookkeeping import phi_of_shell, shell_spatial_mode_count
 
 SparseRegister = List[Tuple[int, float]]
 LigationPairs = List[Tuple[int, int]]
+
+# ``grad_full`` accepts horizon / H-bond / FD extras (e.g. ``em_scale``); ``e_tot_ca_with_bonds`` does not.
+_E_TOT_CA_KWARG_NAMES = frozenset(
+    p
+    for p in inspect.signature(e_tot_ca_with_bonds).parameters
+    if p not in ("positions", "z_list")
+)
+
+
+def _e_tot_ca_kwargs(e_kw: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in e_kw.items() if k in _E_TOT_CA_KWARG_NAMES}
 
 
 def sparse_basis_card(L: int) -> int:
@@ -107,6 +127,82 @@ def apply_ansatz_sparse(
     for k in range(d):
         mix = float(phi_mix if (k % 2 == 0) else psi_mix)
         out = apply_gate_sparse(L, out, gate_mix=mix)
+    return out
+
+
+# Lean ``OctonionicLightCone.referenceM`` (proton anchor); must match HQIV-Lean proofs.
+REFERENCE_M_HQIV_NATIVE = 4
+
+
+def hqiv_pivot_from_shells(
+    shells: np.ndarray,
+    L: int,
+    *,
+    reference_m: int = REFERENCE_M_HQIV_NATIVE,
+) -> int:
+    """
+    Lean ``hqivPivotFromShells``: ``(shells.sum + referenceM) % (L + 1)``.
+    Requires ``len(shells) == L`` (API guard matching ``shells.length = L``).
+    """
+    sh = np.asarray(shells, dtype=np.int64).reshape(-1)
+    if int(sh.shape[0]) != int(L):
+        raise ValueError(f"hqiv_pivot_from_shells: len(shells)={sh.shape[0]} != L={L}")
+    s = int(np.sum(sh))
+    return int((s + int(reference_m)) % (int(L) + 1))
+
+
+def hqiv_harmonic_flat_index_ell_m0(L: int, pivot: int) -> int:
+    """
+    Lean ``hqivHarmonicPivot`` with ``m = 0``: ``ℓ = pivot % (L+1)``, linear index ``ℓ² + m``.
+    Cumulative mode offset for shell ``ℓ`` is ``ℓ²`` on the ``(L+1)²`` harmonic ladder.
+    """
+    ell = int(pivot) % (int(L) + 1)
+    return int(ell * ell)
+
+
+def _hqiv_phase_negate_one_mode(dense: np.ndarray, flat_idx: int) -> np.ndarray:
+    """Lean ``phaseGate``: negate amplitude on one ``HarmonicIndex`` slot (π phase on reals)."""
+    out = np.asarray(dense, dtype=float).copy()
+    fi = int(flat_idx)
+    if 0 <= fi < int(out.size):
+        out[fi] = -float(out[fi])
+    return out
+
+
+def apply_gate_sparse_hqiv_native(
+    L: int,
+    reg: SparseRegister,
+    shells: np.ndarray,
+    *,
+    reference_m: int = REFERENCE_M_HQIV_NATIVE,
+) -> SparseRegister:
+    """
+    Lean ``hqivNativeOracleSparseStep``: ``applyGateSparse`` with ``hqivNativePhaseGate``.
+
+    Same pipeline as ``apply_gate_sparse`` (causal expand → dense → map) but gate is a
+    π phase on the pivot mode from ``hqiv_pivot_from_shells``; preserves ``Σᵢ aᵢ²`` on reals.
+    """
+    pivot = hqiv_pivot_from_shells(shells, L, reference_m=reference_m)
+    flat_idx = hqiv_harmonic_flat_index_ell_m0(L, pivot)
+    expanded = causal_expand_support(L, reg)
+    dense = dense_of_sparse(L, expanded)
+    evolved = _hqiv_phase_negate_one_mode(dense, flat_idx)
+    return [(idx, float(evolved[wrap_idx(L, idx)])) for idx, _ in expanded]
+
+
+def apply_ansatz_sparse_hqiv_native(
+    L: int,
+    reg: SparseRegister,
+    *,
+    depth: int,
+    shells: np.ndarray,
+    reference_m: int = REFERENCE_M_HQIV_NATIVE,
+) -> SparseRegister:
+    """Stack ``depth`` native sparse gates (identical gate each layer — deterministic)."""
+    out = list(reg)
+    d = max(1, int(depth))
+    for _ in range(d):
+        out = apply_gate_sparse_hqiv_native(L, out, shells, reference_m=reference_m)
     return out
 
 
@@ -311,7 +407,7 @@ def _energy_with_ligation(
     ligation_r_max: float,
     ligation_k_bond: float,
 ) -> float:
-    base = float(e_tot_ca_with_bonds(positions, z, **e_kw))
+    base = float(e_tot_ca_with_bonds(positions, z, **_e_tot_ca_kwargs(e_kw)))
     if not ligation_pairs:
         return base
     return float(
@@ -418,6 +514,144 @@ class QAOAHarmonicFoldInfo:
     reservoir_energy_final_ev: float
     reservoir_uphill_accepts: int
     tunnel_harmonic_budget_final_ev: float
+
+
+@dataclass
+class AdditiveKickInfo:
+    step: int
+    applied: bool
+    torque_updated: bool
+    trigger_reason: str
+    kick_norm_mean: float
+    kick_norm_max: float
+    additive_field_trace_ev: float
+    torque_trace_ev: float
+
+
+@dataclass
+class OSHAdditiveCycleInfo:
+    cycle_index: int
+    reservoir_before_ev: float
+    reservoir_after_osh_ev: float
+    reservoir_draw_ev: float
+    horizon_pairs_entered_count: int
+    osh_displacement_mean_ang: float
+    osh_displacement_max_ang: float
+    osh_energy_delta_ev: float
+    osh_info: OSHOracleFoldInfo
+    additive_kick: AdditiveKickInfo
+
+
+def _lattice_full_mode_energy(shell: int) -> float:
+    """Lean bridge: `available_modes * (phi_of_shell / 2)`."""
+    m = int(max(0, shell))
+    return float(shell_spatial_mode_count(m) * (phi_of_shell(m) / 2.0))
+
+
+def _additive_field_and_torque_kick(
+    ca: np.ndarray,
+    *,
+    shell: int,
+    kick_gain: float = 0.004,
+    torque_mix: float = 0.3,
+    kick_max_norm_ang: float = 0.002,
+    cached_torque_diag: Optional[np.ndarray] = None,
+    update_torque: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, AdditiveKickInfo]:
+    """
+    Additive mean-field + infrequent torque kick between OSH cycles.
+
+    - Additive field uses a linear sum over all sites with Manhattan-radius proxy.
+    - Torque term follows Lean's diagonal proxy `orientationDev * field`.
+    """
+    pos = np.asarray(ca, dtype=float)
+    n = int(pos.shape[0])
+    if n < 2:
+        z = np.zeros_like(pos)
+        info = AdditiveKickInfo(
+            step=0,
+            applied=False,
+            torque_updated=bool(update_torque),
+            trigger_reason="too_short",
+            kick_norm_mean=0.0,
+            kick_norm_max=0.0,
+            additive_field_trace_ev=0.0,
+            torque_trace_ev=0.0,
+        )
+        return z, np.zeros((n,), dtype=float), info
+    e_shell = _lattice_full_mode_energy(int(shell))
+    f_scalar = np.zeros((n,), dtype=float)
+    f_vec = np.zeros_like(pos)
+    for i in range(n):
+        acc = np.zeros((3,), dtype=float)
+        s = 0.0
+        for j in range(n):
+            if j == i:
+                continue
+            d = pos[i] - pos[j]
+            r_proxy = float(np.abs(d[0]) + np.abs(d[1]) + np.abs(d[2]) + 1.0)
+            w = float(e_shell / max(1e-8, r_proxy))
+            s += w
+            nd = float(np.linalg.norm(d))
+            if nd > 1e-12:
+                acc += w * d / nd
+        f_scalar[i] = s
+        f_vec[i] = acc
+    # Local orientation deviation: |pi - bend angle| on Cα triples.
+    orient = np.zeros((n,), dtype=float)
+    for i in range(1, n - 1):
+        u = pos[i - 1] - pos[i]
+        v = pos[i + 1] - pos[i]
+        nu = float(np.linalg.norm(u))
+        nv = float(np.linalg.norm(v))
+        if nu < 1e-12 or nv < 1e-12:
+            continue
+        c = float(np.clip(np.dot(u / nu, v / nv), -1.0, 1.0))
+        th = float(np.arccos(c))
+        orient[i] = abs(np.pi - th)
+    if update_torque or cached_torque_diag is None or int(cached_torque_diag.size) != n:
+        torque_diag = orient * f_scalar
+        torque_updated = True
+    else:
+        torque_diag = np.asarray(cached_torque_diag, dtype=float).reshape(-1)
+        torque_updated = False
+    kick = np.zeros_like(pos)
+    for i in range(1, n - 1):
+        t = pos[i + 1] - pos[i - 1]
+        nt = float(np.linalg.norm(t))
+        if nt < 1e-12:
+            continue
+        t = t / nt
+        fv = f_vec[i]
+        nf = float(np.linalg.norm(fv))
+        if nf < 1e-12:
+            continue
+        fv = fv / nf
+        torque_vec = np.cross(t, fv)
+        kt = float(np.clip(torque_mix, 0.0, 1.0))
+        direction = (1.0 - kt) * fv + kt * float(np.tanh(torque_diag[i])) * torque_vec
+        nd = float(np.linalg.norm(direction))
+        if nd < 1e-12:
+            continue
+        kick[i] = -float(max(0.0, kick_gain)) * direction / nd
+    # Global safety: clamp per-residue kick norm to avoid large unstable displacements.
+    kmax = float(max(0.0, kick_max_norm_ang))
+    if kmax > 0.0:
+        kn = np.linalg.norm(kick, axis=1)
+        for i in range(n):
+            if kn[i] > kmax:
+                kick[i] *= kmax / max(1e-12, float(kn[i]))
+    info = AdditiveKickInfo(
+        step=0,
+        applied=True,
+        torque_updated=bool(torque_updated),
+        trigger_reason="applied",
+        kick_norm_mean=float(np.mean(np.linalg.norm(kick, axis=1))),
+        kick_norm_max=float(np.max(np.linalg.norm(kick, axis=1))),
+        additive_field_trace_ev=float(np.sum(f_scalar)),
+        torque_trace_ev=float(np.sum(torque_diag)),
+    )
+    return kick, torque_diag, info
 
 
 def _inertial_pk_energy(
@@ -1204,33 +1438,6 @@ def estimate_natural_harmonic_scale_ca(
     if n < 2:
         return 1.0
     e_kw = dict(energy_kwargs or {})
-    # Full-backbone OSH reuses this helper with ``energy_kwargs`` that target
-    # ``e_tot_backbone_with_bonds`` / ``grad_full_backbone`` — strip / rename for Cα energy.
-    e_kw.pop("ca_target", None)
-    e_kw.pop("k_ca_target", None)
-    e_kw.pop("include_clash", None)
-    e_kw.pop("include_backbone_bonds", None)
-    e_kw.pop("include_horizon", None)
-    e_kw.pop("ca_atom_indices", None)
-    e_kw.pop("bond_edges", None)
-    # Polymer / grad_full kwargs — not accepted by ``e_tot_ca_with_bonds`` (ω estimate is Cα-only).
-    for _k in (
-        "em_scale",
-        "r_ref",
-        "r_horizon",
-        "k_horizon",
-        "use_neighbor_list",
-        "neighbor_cutoff",
-    ):
-        e_kw.pop(_k, None)
-    if "r_bond_min" in e_kw and "r_min" not in e_kw:
-        e_kw["r_min"] = e_kw.pop("r_bond_min")
-    elif "r_bond_min" in e_kw:
-        e_kw.pop("r_bond_min", None)
-    if "r_bond_max" in e_kw and "r_max" not in e_kw:
-        e_kw["r_max"] = e_kw.pop("r_bond_max")
-    elif "r_bond_max" in e_kw:
-        e_kw.pop("r_bond_max", None)
     z = np.full(n, int(z_shell), dtype=np.int32)
     pairs = _normalize_ligation_pairs(ligation_pairs, n)
     e0 = _energy_with_ligation(
@@ -1346,6 +1553,7 @@ def minimize_ca_with_osh_oracle(
     ligation_r_max: float = 6.0,
     ligation_k_bond: float = 60.0,
     z_shell: int = 6,
+    z_shells: Optional[np.ndarray] = None,
     n_iter: int = 120,
     step_size: float = 0.03,
     gate_mix: float = 0.55,
@@ -1413,6 +1621,8 @@ def minimize_ca_with_osh_oracle(
     contact_terminus_window: int = 0,
     contact_terminus_score_scale: float = 1.0,
     energy_kwargs: Optional[Dict[str, Any]] = None,
+    use_hqiv_native_gate: bool = False,
+    hqiv_reference_m: int = REFERENCE_M_HQIV_NATIVE,
 ) -> Tuple[np.ndarray, OSHOracleFoldInfo]:
     """
     Cα minimization driven by OSHoracle sparse support updates.
@@ -1423,6 +1633,10 @@ def minimize_ca_with_osh_oracle(
     - apply causal expand + gate evolve,
     - detect flipped support and update only mapped residues,
     - accept if energy improves (simple backoff otherwise).
+
+    ``use_hqiv_native_gate``: if True, use Lean ``hqivNativePhaseGate`` / ``hqivPivotFromShells``
+    (π phase on one harmonic mode; pivot from per-residue ``z`` shells and ``hqiv_reference_m``).
+    Sparse cutoff ``L`` is set to ``n`` residues to match ``ProteinFoldingHook`` (else ``max(1,n-1)``).
 
     Optional ``use_contact_reflectors``: add virtual wave reflectors at nonlocal Cα
     contacts (and optionally gradient-weighted) to reshape harmonic tunnel budgets
@@ -1458,7 +1672,13 @@ def minimize_ca_with_osh_oracle(
         return ca, info
 
     e_kw = dict(energy_kwargs or {})
-    z = np.full(n, int(z_shell), dtype=np.int32)
+    if z_shells is not None:
+        zs = np.asarray(z_shells, dtype=np.int32).reshape(-1)
+        if int(zs.shape[0]) != n:
+            raise ValueError("minimize_ca_with_osh_oracle: z_shells must have length n.")
+        z = zs
+    else:
+        z = np.full(n, int(z_shell), dtype=np.int32)
     pairs = _normalize_ligation_pairs(ligation_pairs, n)
     if bool(auto_detect_cys_ligation) and sequence:
         pairs = _normalize_ligation_pairs(
@@ -1466,8 +1686,10 @@ def minimize_ca_with_osh_oracle(
             n,
         )
     L = max(1, n - 1)
+    L_sparse = int(n) if bool(use_hqiv_native_gate) else int(L)
+    shells_hqiv = np.asarray(z, dtype=np.int64)
     step = float(step_size)
-    atom_mass_like = np.full(n, float(max(1, int(z_shell))), dtype=float)
+    atom_mass_like = np.maximum(1.0, z.astype(float))
     velocity = np.zeros_like(ca)
     prev_ca = ca.copy()
     reservoir = float(max(0.0, reservoir_init))
@@ -1576,18 +1798,27 @@ def minimize_ca_with_osh_oracle(
             contact_reflector_count_last = len(cref)
         q = float(np.clip(amp_threshold_quantile, 0.0, 1.0))
         thresh = float(np.quantile(mags, q)) if mags.size else 0.0
-        reg = _register_from_gradients(grad, L=L, amp_threshold=thresh)
+        reg = _register_from_gradients(grad, L=L_sparse, amp_threshold=thresh)
         # Decouple phase schedule from safety cap: fixed period keeps dynamics invariant
         # when only max-iteration budget changes.
         phase_it = int(it % sched_n)
         phi_mix, psi_mix = current_parameters(phase_it, sched_n, gate_mix)
-        reg_after = apply_ansatz_sparse(
-            L,
-            reg,
-            depth=int(ansatz_depth),
-            phi_mix=float(phi_mix),
-            psi_mix=float(psi_mix),
-        )
+        if bool(use_hqiv_native_gate):
+            reg_after = apply_ansatz_sparse_hqiv_native(
+                L_sparse,
+                reg,
+                depth=int(ansatz_depth),
+                shells=shells_hqiv,
+                reference_m=int(hqiv_reference_m),
+            )
+        else:
+            reg_after = apply_ansatz_sparse(
+                L_sparse,
+                reg,
+                depth=int(ansatz_depth),
+                phi_mix=float(phi_mix),
+                psi_mix=float(psi_mix),
+            )
         flipped = (
             detect_flipped_kets_amplitude(
                 prev_reg,
@@ -1827,3 +2058,183 @@ def minimize_ca_with_osh_oracle(
         omega_refresh_count=int(omega_refresh_count),
     )
     return ca, info
+
+
+def minimize_ca_with_osh_oracle_additive_cycles(
+    ca_init: np.ndarray,
+    *,
+    max_cycles: int = 4,
+    additive_update_every: int = 1,
+    additive_kick_gain: float = 0.004,
+    additive_torque_mix: float = 0.3,
+    cycle_kick_stop_tol: float = 1e-4,
+    cycle_energy_stop_tol: float = 1e-4,
+    em_trigger_every_n_cycles: int = 0,
+    em_trigger_on_settled: bool = True,
+    em_trigger_disp_mean_ang: float = 0.35,
+    em_trigger_energy_rise_ev: float = 1e3,
+    em_trigger_reservoir_draw_ev: float = 5.0,
+    em_trigger_horizon_enter_count: int = 1,
+    em_trigger_horizon_radius_ang: float = 15.0,
+    em_trigger_horizon_min_seq_sep: int = 3,
+    reservoir_carry_cap_ev: float = 1e6,
+    kick_max_norm_ang: float = 0.002,
+    kick_accept_max_energy_rise_ev: float = 5e3,
+    **osh_kwargs: Any,
+) -> Tuple[np.ndarray, OSHOracleFoldInfo, List[OSHAdditiveCycleInfo]]:
+    """
+    Cyclic refinement: OSHoracle settle -> additive field/torque kick -> repeat.
+
+    Budget bookkeeping:
+    - Reservoir is carried between cycles (`reservoir_init <- reservoir_energy_final_ev`).
+    - Per-cycle additive field and torque trace terms are reported.
+    """
+    ca = np.asarray(ca_init, dtype=float).copy()
+    if ca.ndim != 2 or ca.shape[1] != 3:
+        raise ValueError("minimize_ca_with_osh_oracle_additive_cycles: ca_init must be shape (n,3).")
+    n = int(ca.shape[0])
+    if n < 2:
+        info = OSHOracleFoldInfo(
+            iterations=0,
+            iterations_executed=0,
+            accepted_steps=0,
+            final_energy_ev=0.0,
+            last_step_size=0.0,
+            last_flipped_count=0,
+            avg_flipped_count=0.0,
+            natural_harmonic_scale=1.0,
+            metropolis_accepts=0,
+            stop_reason="too_short",
+            settled=True,
+            inertial_energy_final_ev=0.0,
+            reservoir_energy_final_ev=float(osh_kwargs.get("reservoir_init", 0.0)),
+            reservoir_uphill_accepts=0,
+            tunnel_harmonic_budget_final_ev=0.0,
+            contact_reflector_count=0,
+            omega_refresh_count=0,
+        )
+        return ca, info, []
+
+    base_kwargs = dict(osh_kwargs)
+    reservoir_carry = float(max(0.0, base_kwargs.get("reservoir_init", 0.0)))
+    res_cap = float(max(0.0, reservoir_carry_cap_ev))
+    if res_cap > 0.0:
+        reservoir_carry = min(reservoir_carry, res_cap)
+    torque_cache: Optional[np.ndarray] = None
+    prev_energy: Optional[float] = None
+    cycle_infos: List[OSHAdditiveCycleInfo] = []
+    last_info: Optional[OSHOracleFoldInfo] = None
+    n_cycles = max(1, int(max_cycles))
+    update_every = max(1, int(additive_update_every))
+    z_shell = int(base_kwargs.get("z_shell", 6))
+    r_min = float(base_kwargs.get("r_min", 2.5))
+    r_max = float(base_kwargs.get("r_max", 6.0))
+    for cyc in range(n_cycles):
+        ca_before = ca.copy()
+        cyc_kwargs = dict(base_kwargs)
+        cyc_kwargs["reservoir_init"] = float(reservoir_carry)
+        ca, info = minimize_ca_with_osh_oracle(ca, **cyc_kwargs)
+        last_info = info
+        reservoir_after_osh = float(max(0.0, info.reservoir_energy_final_ev))
+        reservoir_draw = float(max(0.0, float(cyc_kwargs["reservoir_init"]) - reservoir_after_osh))
+        d_ca = np.linalg.norm(ca - ca_before, axis=1)
+        disp_mean = float(np.mean(d_ca)) if d_ca.size else 0.0
+        disp_max = float(np.max(d_ca)) if d_ca.size else 0.0
+        e_delta = 0.0 if prev_energy is None else float(info.final_energy_ev - prev_energy)
+        h_enter = int(
+            count_nonlocal_pairs_entering_horizon(
+                ca_before,
+                ca,
+                r_horizon=float(em_trigger_horizon_radius_ang),
+                min_seq_sep=int(em_trigger_horizon_min_seq_sep),
+            )
+        )
+        reservoir_carry = reservoir_after_osh
+        if res_cap > 0.0:
+            reservoir_carry = min(reservoir_carry, res_cap)
+        reasons: List[str] = []
+        if bool(em_trigger_on_settled) and bool(info.settled):
+            reasons.append("settled")
+        if disp_mean >= float(em_trigger_disp_mean_ang):
+            reasons.append("big_shift")
+        if e_delta >= float(em_trigger_energy_rise_ev):
+            reasons.append("energy_rise")
+        if reservoir_draw >= float(em_trigger_reservoir_draw_ev):
+            reasons.append("reservoir_draw")
+        if h_enter >= int(max(0, em_trigger_horizon_enter_count)):
+            reasons.append("horizon_enter")
+        per_n = int(em_trigger_every_n_cycles)
+        if per_n > 0 and ((cyc + 1) % per_n) == 0:
+            reasons.append("periodic")
+        should_kick = len(reasons) > 0
+        if should_kick:
+            do_update_torque = (cyc % update_every) == 0
+            kick, torque_cache, kick_info = _additive_field_and_torque_kick(
+                ca,
+                shell=z_shell,
+                kick_gain=float(additive_kick_gain),
+                torque_mix=float(additive_torque_mix),
+                kick_max_norm_ang=float(kick_max_norm_ang),
+                cached_torque_diag=torque_cache,
+                update_torque=bool(do_update_torque),
+            )
+            kick_info.step = int(cyc)
+            kick_info.trigger_reason = ",".join(reasons)
+            ca_candidate = _project_bonds(ca + kick, r_min=r_min, r_max=r_max)
+            # Safety gate: reject kick if non-finite or causes too-large energy rise.
+            if not np.isfinite(ca_candidate).all():
+                kick_info.applied = False
+                kick_info.trigger_reason = f"{kick_info.trigger_reason},rejected_nonfinite"
+            else:
+                e_after_kick = float(
+                    e_tot_ca_with_bonds(
+                        ca_candidate,
+                        np.full(n, int(z_shell), dtype=np.int32),
+                        **_e_tot_ca_kwargs(
+                            dict(base_kwargs.get("energy_kwargs", {}) or {})
+                        ),
+                    )
+                )
+                e_before_kick = float(info.final_energy_ev)
+                if (not np.isfinite(e_after_kick)) or (
+                    e_after_kick - e_before_kick > float(kick_accept_max_energy_rise_ev)
+                ):
+                    kick_info.applied = False
+                    kick_info.trigger_reason = f"{kick_info.trigger_reason},rejected_energy_shock"
+                else:
+                    ca = ca_candidate
+        else:
+            kick_info = AdditiveKickInfo(
+                step=int(cyc),
+                applied=False,
+                torque_updated=False,
+                trigger_reason="not_triggered",
+                kick_norm_mean=0.0,
+                kick_norm_max=0.0,
+                additive_field_trace_ev=0.0,
+                torque_trace_ev=0.0,
+            )
+        cycle_infos.append(
+            OSHAdditiveCycleInfo(
+                cycle_index=int(cyc),
+                reservoir_before_ev=float(cyc_kwargs["reservoir_init"]),
+                reservoir_after_osh_ev=float(reservoir_after_osh),
+                reservoir_draw_ev=float(reservoir_draw),
+                horizon_pairs_entered_count=int(h_enter),
+                osh_displacement_mean_ang=float(disp_mean),
+                osh_displacement_max_ang=float(disp_max),
+                osh_energy_delta_ev=float(e_delta),
+                osh_info=info,
+                additive_kick=kick_info,
+            )
+        )
+        energy_converged = (
+            prev_energy is not None
+            and abs(float(info.final_energy_ev) - float(prev_energy)) <= float(cycle_energy_stop_tol)
+        )
+        prev_energy = float(info.final_energy_ev)
+        if bool(info.settled) and kick_info.kick_norm_mean <= float(cycle_kick_stop_tol) and energy_converged:
+            break
+    if last_info is None:
+        raise RuntimeError("minimize_ca_with_osh_oracle_additive_cycles: no cycles executed")
+    return ca, last_info, cycle_infos

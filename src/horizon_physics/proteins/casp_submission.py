@@ -2,7 +2,7 @@
 CASP submission: FASTA → PDB generator using HQIV structure prediction.
 
 hqiv_predict_structure(fasta: str) -> str returns a valid CASP-format PDB string
-(MODEL 1 ... END) using peptide_backbone, alpha_helix, beta_sheet, side_chain_placement.
+(REMARK HQIV-QConSi-*-step + MODEL ... END) using peptide_backbone, alpha_helix, beta_sheet, side_chain_placement.
 No external dependencies beyond numpy.
 
 MIT License, Python 3.10+.
@@ -13,6 +13,7 @@ from __future__ import annotations
 import numpy as np
 from typing import List, Optional, Tuple
 
+from .pdb_hqiv_header import hqiv_qconsi_empty_pdb_block, hqiv_qconsi_model_lines
 from .peptide_backbone import backbone_bond_lengths, backbone_geometry, omega_peptide_deg, ramachandran_alpha, ramachandran_beta
 from .alpha_helix import alpha_helix_geometry, alpha_helix_xyz
 from .beta_sheet import beta_sheet_geometry
@@ -196,15 +197,15 @@ def hqiv_predict_structure(
     ss_string: Optional[str] = None,
 ) -> str:
     """
-    FASTA → PDB string (CASP format: MODEL 1 ... END). Uses HQIV backbone and
+    FASTA → PDB string (CASP format: REMARK HQIV-QConSi-*-step + MODEL ... END). Uses HQIV backbone and
     SS-aware Cα placement: if ss_string is None, predict from sequence (predict_ss).
     """
     sequence = _parse_fasta(fasta)
     if not sequence:
-        return "MODEL     1\nEND\n"
+        return hqiv_qconsi_empty_pdb_block()
     ca_pos = _place_backbone_ca(sequence, ss_string=ss_string)
     atoms = _place_full_backbone(ca_pos, sequence)
-    lines = ["MODEL     1"]
+    lines = list(hqiv_qconsi_model_lines())
     atom_id = 1
     n_res = len(sequence)
     atoms_per_res = 4  # N, CA, C, O
@@ -225,16 +226,16 @@ def hqiv_predict_structure_assembly(
     ss_strings: Optional[List[Optional[str]]] = None,
 ) -> str:
     """
-    Multiple sequences (assembly/complex) → one PDB (MODEL 1) with chain A, B, C, ...
+    Multiple sequences (assembly/complex) → one PDB (HQIV-QConSi header) with chain A, B, C, ...
     Each item in sequences can be FASTA or raw sequence. ss_strings[i] optional per chain.
     """
     if not sequences:
-        return "MODEL     1\nEND\n"
+        return hqiv_qconsi_empty_pdb_block()
     if ss_strings is None:
         ss_strings = [None] * len(sequences)
     while len(ss_strings) < len(sequences):
         ss_strings.append(None)
-    lines = ["MODEL     1"]
+    lines = list(hqiv_qconsi_model_lines())
     atom_id = 1
     chain_ids = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     for i, fasta_or_seq in enumerate(sequences):
@@ -265,4 +266,4 @@ if __name__ == "__main__":
     print("CASP PDB (HQIV):")
     print(pdb[:800])
     print("...")
-    assert "MODEL" in pdb and "ENDMDL" in pdb and "ATOM" in pdb
+    assert "MODEL" in pdb and "ENDMDL" in pdb and "ATOM" in pdb and "HQIV-QConSi" in pdb

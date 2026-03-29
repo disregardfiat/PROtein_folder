@@ -44,7 +44,7 @@ def _lean_kw(quick: bool, *, tunnel: bool) -> dict:
             "min_pass_iter_per_connection": 5,
             "hbond_weight": 0.0,
             "hbond_shell_m": 3,
-            "ligand_refine_steps": 40,
+            "ligand_refine_steps": 50,
         }
     else:
         base = {
@@ -56,7 +56,7 @@ def _lean_kw(quick: bool, *, tunnel: bool) -> dict:
             "min_pass_iter_per_connection": 15,
             "hbond_weight": 0.0,
             "hbond_shell_m": 3,
-            "ligand_refine_steps": 40,
+            "ligand_refine_steps": 150,
         }
     if not tunnel:
         base["simulate_ribosome_tunnel"] = False

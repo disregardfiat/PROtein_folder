@@ -19,13 +19,11 @@ import numpy as np
 
 from .casp_submission import _place_full_backbone
 from .folding_energy import e_tot_ca_with_bonds
-from .full_atom_topology import FullHeavyAtomChain, build_full_heavy_chain, chain_to_pdb_line_string
 from .full_protein_minimizer import full_chain_to_pdb, minimize_full_chain
 from .gradient_descent_folding import _project_bonds
 from .grade_folds import load_ca_and_sequence_from_pdb
 from .lean_ribosome_tunnel_pipeline import fold_lean_ribosome_tunnel
 from .osh_oracle_folding import minimize_ca_with_osh_oracle
-from .osh_oracle_full_atom import minimize_full_heavy_with_osh_oracle
 
 BackboneAtoms = List[Tuple[str, np.ndarray]]
 StageFn = Callable[["FoldState"], "FoldState"]
@@ -38,8 +36,6 @@ class FoldState:
     sequence: str
     ca_positions: Optional[np.ndarray] = None
     backbone_atoms: Optional[BackboneAtoms] = None
-    #: After ``make_full_heavy_osh_stage``; use :meth:`to_pdb` for all-atom PDB output.
-    full_heavy_chain: Optional[FullHeavyAtomChain] = None
     raw_result: Optional[Dict[str, Any]] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     stage_history: List[Dict[str, Any]] = field(default_factory=list)
@@ -65,21 +61,15 @@ class FoldState:
             if self.ca_positions is None:
                 raise ValueError("FoldState.to_result_dict: no backbone_atoms or ca_positions available.")
             bb = _place_full_backbone(np.asarray(self.ca_positions, dtype=float), self.sequence)
-        out: Dict[str, Any] = {
+        return {
             "sequence": self.sequence,
             "n_res": len(self.sequence),
             "backbone_atoms": bb,
             "include_sidechains": False,
         }
-        if self.full_heavy_chain is not None:
-            out["full_heavy_chain"] = self.full_heavy_chain
-        raw = self.raw_result or {}
-        if raw.get("ligands"):
-            out["ligands"] = raw["ligands"]
-        return out
 
-    def to_pdb(self, chain_id: str = "A", ligand_chain_id: Optional[str] = None) -> str:
-        return full_chain_to_pdb(self.to_result_dict(), chain_id=chain_id, ligand_chain_id=ligand_chain_id)
+    def to_pdb(self, chain_id: str = "A") -> str:
+        return full_chain_to_pdb(self.to_result_dict(), chain_id=chain_id)
 
 
 def _state_with_result(
@@ -91,7 +81,6 @@ def _state_with_result(
 ) -> FoldState:
     ca = np.asarray(result.get("ca_min"), dtype=float) if result.get("ca_min") is not None else state.ca_positions
     bb = result.get("backbone_atoms")
-    fhc = result.get("full_heavy_chain")
     entry = {
         "stage": stage_name,
         "E_ca_final": result.get("E_ca_final"),
@@ -99,13 +88,10 @@ def _state_with_result(
         "info": result.get("info"),
         "config": stage_config or {},
     }
-    if result.get("full_heavy_osh_info") is not None:
-        entry["full_heavy_osh_info"] = result.get("full_heavy_osh_info")
     return FoldState(
         sequence=state.sequence,
         ca_positions=np.asarray(ca, dtype=float) if ca is not None else None,
         backbone_atoms=bb if bb is not None else state.backbone_atoms,
-        full_heavy_chain=fhc if fhc is not None else None,
         raw_result=result,
         metadata=dict(state.metadata),
         stage_history=[*state.stage_history, entry],
@@ -133,35 +119,6 @@ def _state_with_ca(
         sequence=state.sequence,
         ca_positions=ca,
         backbone_atoms=bb,
-        full_heavy_chain=None,
-        raw_result=state.raw_result,
-        metadata=dict(state.metadata),
-        stage_history=[*state.stage_history, entry],
-    )
-
-
-def _state_with_full_heavy(
-    state: FoldState,
-    *,
-    stage_name: str,
-    chain: FullHeavyAtomChain,
-    info: Dict[str, Any],
-    stage_config: Dict[str, Any],
-) -> FoldState:
-    ca = chain.positions[np.asarray(chain.ca_atom_indices, dtype=int)].copy()
-    bb = _place_full_backbone(ca, state.sequence)
-    entry = {
-        "stage": stage_name,
-        "E_ca_final": None,
-        "E_backbone_final": None,
-        "info": info,
-        "config": stage_config,
-    }
-    return FoldState(
-        sequence=state.sequence,
-        ca_positions=ca,
-        backbone_atoms=bb,
-        full_heavy_chain=chain,
         raw_result=state.raw_result,
         metadata=dict(state.metadata),
         stage_history=[*state.stage_history, entry],
@@ -464,6 +421,8 @@ def make_osh_oracle_stage(
     contact_terminus_window: int = 0,
     contact_terminus_score_scale: float = 1.0,
     energy_kwargs: Optional[Dict[str, Any]] = None,
+    use_hqiv_native_gate: bool = False,
+    hqiv_reference_m: int = 4,
 ) -> StageFn:
     """
     Build a stage around the OSHoracle-inspired sparse support optimizer.
@@ -541,6 +500,8 @@ def make_osh_oracle_stage(
             terminus_gradient_core_scale=float(terminus_gradient_core_scale),
             contact_terminus_window=int(contact_terminus_window),
             contact_terminus_score_scale=float(contact_terminus_score_scale),
+            use_hqiv_native_gate=bool(use_hqiv_native_gate),
+            hqiv_reference_m=int(hqiv_reference_m),
         )
         info = {
             "message": "OSHoracle sparse refinement complete",
@@ -573,6 +534,8 @@ def make_osh_oracle_stage(
             "terminus_gradient_transition_width": int(terminus_gradient_transition_width),
             "contact_terminus_window": int(contact_terminus_window),
             "contact_terminus_score_scale": float(contact_terminus_score_scale),
+            "use_hqiv_native_gate": bool(use_hqiv_native_gate),
+            "hqiv_reference_m": int(hqiv_reference_m),
         }
         cfg = {
             "z_shell": int(z_shell),
@@ -632,106 +595,6 @@ def make_osh_oracle_stage(
     return _run
 
 
-def make_full_heavy_osh_stage(
-    name: str = "full_heavy_osh_refine",
-    *,
-    include_sidechain_heavy: bool = True,
-    z_shell: int = 6,
-    n_iter: int = 200,
-    step_size: float = 0.02,
-    gate_mix: float = 0.55,
-    ansatz_depth: int = 2,
-    amp_threshold_quantile: float = 0.7,
-    use_energy_reservoir: bool = True,
-    reservoir_init: float = 40.0,
-    reservoir_gain_scale: float = 1.2,
-    harmonic_max_dims: int = 120,
-    backbone_projection_passes: int = 3,
-    stop_when_settled: bool = False,
-    settle_window: int = 30,
-    settle_energy_tol: float = 2e-5,
-    settle_step_tol: float = 2e-5,
-    settle_min_iter: int = 50,
-    energy_kwargs: Optional[Dict[str, Any]] = None,
-    freeze_ca_positions: bool = False,
-    extra_minimizer_kwargs: Optional[Dict[str, Any]] = None,
-) -> StageFn:
-    """
-    Full heavy-atom OSH stage: builds :class:`~.full_atom_topology.FullHeavyAtomChain` from Cα,
-    runs ``minimize_full_heavy_with_osh_oracle``, stores chain on state for :meth:`FoldState.to_pdb`.
-
-    Pass ``freeze_ca_positions=True`` only when you want a fixed Cα trace; otherwise full-atom energy couples
-    to the backbone (see ``limit_ca_displacement_ang`` on ``minimize_full_heavy_with_osh_oracle``).
-    """
-
-    e_kw = dict(energy_kwargs or {})
-
-    def _run(state: FoldState) -> FoldState:
-        if state.ca_positions is None:
-            raise ValueError("full heavy OSH stage needs CA coordinates in state.")
-        ca0 = np.asarray(state.ca_positions, dtype=float)
-        if ca0.shape != (len(state.sequence), 3):
-            raise ValueError("full heavy OSH: ca_positions must be (n_res, 3).")
-        chain = build_full_heavy_chain(
-            state.sequence,
-            ca0,
-            include_sidechain_heavy=bool(include_sidechain_heavy),
-        )
-        pos0 = chain.copy_positions()
-        call: Dict[str, Any] = {
-            "z_shell": int(z_shell),
-            "n_iter": int(n_iter),
-            "step_size": float(step_size),
-            "gate_mix": float(gate_mix),
-            "ansatz_depth": int(ansatz_depth),
-            "amp_threshold_quantile": float(amp_threshold_quantile),
-            "use_energy_reservoir": bool(use_energy_reservoir),
-            "reservoir_init": float(reservoir_init),
-            "reservoir_gain_scale": float(reservoir_gain_scale),
-            "harmonic_max_dims": int(harmonic_max_dims),
-            "backbone_projection_passes": int(backbone_projection_passes),
-            "stop_when_settled": bool(stop_when_settled),
-            "settle_window": int(settle_window),
-            "settle_energy_tol": float(settle_energy_tol),
-            "settle_step_tol": float(settle_step_tol),
-            "settle_min_iter": int(settle_min_iter),
-            "energy_kwargs": e_kw,
-        }
-        call.update(dict(extra_minimizer_kwargs or {}))
-        if "freeze_ca_positions" not in call:
-            call["freeze_ca_positions"] = bool(freeze_ca_positions)
-        if call.get("freeze_ca_positions") is not True:
-            call.setdefault("limit_ca_displacement_ang", 0.22)
-        pos1, info_obj = minimize_full_heavy_with_osh_oracle(
-            pos0,
-            chain.z,
-            chain.bond_edges,
-            chain.residue_ranges,
-            chain.ca_atom_indices,
-            **call,
-        )
-        chain.positions[:] = pos1
-        info = {
-            "message": "full heavy OSH refinement complete",
-            "accepted_steps": int(info_obj.accepted_steps),
-            "iterations_executed": int(info_obj.iterations_executed),
-            "final_energy_ev": float(info_obj.final_energy_ev),
-            "stop_reason": str(info_obj.stop_reason),
-            "n_atoms": int(chain.positions.shape[0]),
-            "include_sidechain_heavy": bool(include_sidechain_heavy),
-        }
-        cfg = {**call, **info}
-        return _state_with_full_heavy(
-            state,
-            stage_name=name,
-            chain=chain,
-            info=info,
-            stage_config=cfg,
-        )
-
-    return _run
-
-
 def run_pipeline(initial: FoldState, stages: Sequence[StageFn]) -> FoldState:
     """Run a sequence of stages, returning the final fold state."""
     state = initial
@@ -745,18 +608,12 @@ def run_tunnel_first_pipeline(
     *,
     tunnel_kwargs: Optional[Dict[str, Any]] = None,
     refinement_stages: Optional[Sequence[StageFn]] = None,
-    append_full_heavy_osh: bool = False,
-    full_heavy_osh_stage_kwargs: Optional[Dict[str, Any]] = None,
 ) -> FoldState:
     """
     Enforce a tunnel-first flow, then execute interchangeable refinement stages.
 
     This guarantees the residue chain always passes through a tunnel extrusion/fold step
     before additional algorithmic variants are applied.
-
-    Set ``append_full_heavy_osh=True`` to add a :func:`make_full_heavy_osh_stage` after the tunnel
-    (and after any ``refinement_stages``). Use ``full_heavy_osh_stage_kwargs`` for stage options
-    (same keywords as ``make_full_heavy_osh_stage``, including optional ``name``).
     """
     tkw = dict(tunnel_kwargs or {})
     tkw["simulate_ribosome_tunnel"] = True
@@ -764,9 +621,5 @@ def run_tunnel_first_pipeline(
     stages: List[StageFn] = [tunnel_stage]
     if refinement_stages:
         stages.extend(list(refinement_stages))
-    if append_full_heavy_osh:
-        osh_kw = dict(full_heavy_osh_stage_kwargs or {})
-        stage_name = str(osh_kw.pop("name", "full_heavy_osh_refine"))
-        stages.append(make_full_heavy_osh_stage(stage_name, **osh_kw))
     return run_pipeline(initial, stages)
 

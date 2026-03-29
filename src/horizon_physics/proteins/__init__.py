@@ -32,7 +32,6 @@ from .folding_energy import (
     build_horizon_poles,
     build_bond_poles,
     grad_from_poles,
-    full_atom_polymer_energy_budget,
 )
 from .casp_submission import hqiv_predict_structure, hqiv_predict_structure_assembly
 from .gradient_descent_folding import (
@@ -57,7 +56,6 @@ from .pipeline_interchange import (
     make_force_carrier_stage,
     make_lean_tunnel_stage,
     make_osh_oracle_stage,
-    make_full_heavy_osh_stage,
     run_pipeline,
     run_tunnel_first_pipeline,
 )
@@ -68,6 +66,11 @@ from .osh_oracle_folding import (
     causal_expand_support,
     dense_of_sparse,
     apply_gate_sparse,
+    REFERENCE_M_HQIV_NATIVE,
+    apply_ansatz_sparse_hqiv_native,
+    apply_gate_sparse_hqiv_native,
+    hqiv_harmonic_flat_index_ell_m0,
+    hqiv_pivot_from_shells,
     apply_ansatz_sparse,
     current_parameters,
     detect_flipped_kets,
@@ -84,23 +87,20 @@ from .osh_oracle_folding import (
     harmonic_tunneled_qaoa_folding,
     prune_to_flipped,
     OSHOracleFoldInfo,
+    AdditiveKickInfo,
+    OSHAdditiveCycleInfo,
     minimize_ca_with_osh_oracle,
+    minimize_ca_with_osh_oracle_additive_cycles,
     contact_reflector_indices,
     compute_tunnel_harmonic_budget_ev,
 )
 from .osh_oracle_backbone import minimize_backbone_with_osh_oracle
-from .osh_oracle_full_atom import minimize_full_heavy_with_osh_oracle
-from .full_atom_topology import (
-    FullHeavyAtomChain,
-    build_full_heavy_chain,
-    chain_to_pdb_line_string,
-    full_heavy_chain_energy_budget,
-)
-from .very_short_fold_targets import (
-    VERY_SHORT_FOLD_TARGETS,
-    VERY_SHORT_FOLD_TARGETS_LIST,
-    VeryShortFoldTarget,
-    target_by_key,
+from .side_by_side_minimum import run_side_by_side_minimum
+from .side_by_side_lean_qc import (
+    eta_mode_phi_constant,
+    lattice_full_mode_energy_ev,
+    run_side_by_side_lean_qc,
+    site_energy_trace_ev,
 )
 from .ligands import (
     LigandAgent,
@@ -165,7 +165,6 @@ __all__ = [
     "build_horizon_poles",
     "build_bond_poles",
     "grad_from_poles",
-    "full_atom_polymer_energy_budget",
     "hqiv_predict_structure",
     "hqiv_predict_structure_assembly",
     "minimize_e_tot_lbfgs",
@@ -195,7 +194,6 @@ __all__ = [
     "make_force_carrier_stage",
     "make_lean_tunnel_stage",
     "make_osh_oracle_stage",
-    "make_full_heavy_osh_stage",
     "run_pipeline",
     "run_tunnel_first_pipeline",
     "SparseRegister",
@@ -204,6 +202,11 @@ __all__ = [
     "causal_expand_support",
     "dense_of_sparse",
     "apply_gate_sparse",
+    "REFERENCE_M_HQIV_NATIVE",
+    "hqiv_pivot_from_shells",
+    "hqiv_harmonic_flat_index_ell_m0",
+    "apply_gate_sparse_hqiv_native",
+    "apply_ansatz_sparse_hqiv_native",
     "apply_ansatz_sparse",
     "current_parameters",
     "detect_flipped_kets",
@@ -221,16 +224,11 @@ __all__ = [
     "prune_to_flipped",
     "OSHOracleFoldInfo",
     "minimize_ca_with_osh_oracle",
-    "minimize_backbone_with_osh_oracle",
-    "minimize_full_heavy_with_osh_oracle",
-    "FullHeavyAtomChain",
-    "build_full_heavy_chain",
-    "chain_to_pdb_line_string",
-    "full_heavy_chain_energy_budget",
-    "VERY_SHORT_FOLD_TARGETS",
-    "VERY_SHORT_FOLD_TARGETS_LIST",
-    "VeryShortFoldTarget",
-    "target_by_key",
+    "run_side_by_side_minimum",
+    "eta_mode_phi_constant",
+    "lattice_full_mode_energy_ev",
+    "site_energy_trace_ev",
+    "run_side_by_side_lean_qc",
     "LigandAgent",
     "ligand_summary",
     "parse_ligands",

@@ -138,8 +138,10 @@ class Atom:
 
 
 def atoms_to_pdb(atoms: List[Atom], chain_id: str = "A") -> str:
-    """Convert Atom list to CASP-format PDB string (MODEL 1 ... END)."""
-    lines = ["MODEL     1"]
+    """Convert Atom list to CASP-format PDB string (HQIV-QConSi header ... END)."""
+    from .pdb_hqiv_header import hqiv_qconsi_model_lines
+
+    lines = list(hqiv_qconsi_model_lines())
     atom_id = 1
     for a in atoms:
         lines.append(

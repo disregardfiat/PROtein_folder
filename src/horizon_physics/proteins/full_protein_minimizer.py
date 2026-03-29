@@ -68,6 +68,8 @@ from .force_carrier_ensemble import (
     maybe_refresh_em_field_direction_set,
 )
 from .ligands import LigandAgent, parse_ligands
+from .pdb_hqiv_header import hqiv_qconsi_empty_pdb_block, hqiv_qconsi_model_lines
+from .protein_qc_refinement import grad_qc_soft_clash_protein_fixed
 from .peptide_backbone import backbone_bond_lengths
 from .side_chain_placement import chi_angles_for_residue, side_chain_chi_preferences
 
@@ -473,6 +475,9 @@ LONG_CHAIN_COLLAPSE_INIT_STEPS = 40
 LIGAND_REFINE_STEPS = 50
 LIGAND_STEP_T = 0.05
 LIGAND_STEP_ANG = 0.02
+# Lean ``ProteinQCRefinement``: soft clash σ (Å) and weight on clash vs site trace (gradient uses clash only).
+LIGAND_QC_SOFT_SIGMA = 3.0
+LIGAND_QC_CLASH_WEIGHT = 1.0
 
 
 def _refine_ligands_6dof(
@@ -483,8 +488,18 @@ def _refine_ligands_6dof(
     step_t: float = LIGAND_STEP_T,
     step_ang: float = LIGAND_STEP_ANG,
     grad_full_kwargs: Optional[Dict[str, Any]] = None,
+    *,
+    ligand_refinement_mode: str = "lean_qc",
+    qc_soft_clash_sigma: float = LIGAND_QC_SOFT_SIGMA,
+    qc_clash_weight: float = LIGAND_QC_CLASH_WEIGHT,
 ) -> None:
-    """Minimize E_tot over ligand 6-DOF only; protein positions fixed. Modifies ligands in place."""
+    """
+    Minimize energy over ligand 6-DOF only; protein positions fixed. Modifies ligands in place.
+
+    ``ligand_refinement_mode``:
+      - ``lean_qc``: Lean ``ProteinQCRefinement`` — weighted soft clash vs a single σ (site term is constant).
+      - ``horizon``: legacy ``grad_full`` + protein bond restoration on the fixed backbone.
+    """
     n_bb = pos_bb.shape[0]
     n_lig_atoms = sum(lig.n_atoms() for lig in ligands)
     if n_lig_atoms == 0:
@@ -498,6 +513,11 @@ def _refine_ligands_6dof(
         indices_per_ligand.append(list(range(off, off + n)))
         off += n
 
+    mode = str(ligand_refinement_mode or "lean_qc").strip().lower()
+    use_qc = mode in ("lean_qc", "qc", "protein_qc_refinement")
+    sigma = float(qc_soft_clash_sigma)
+    w_clash = float(max(0.0, qc_clash_weight))
+
     # Match ``minimize_full_chain`` ``grad_full`` screening (``em_scale``, …). The
     # ``hBondProxy`` FD term is Cα-chain-only; disable it for protein+ligand atom arrays.
     gkw = dict(grad_full_kwargs or {})
@@ -506,15 +526,19 @@ def _refine_ligands_6dof(
     for _ in range(max_steps):
         lig_pos = np.concatenate([lig.get_world_positions() for lig in ligands], axis=0)
         combined = np.concatenate([pos_bb, lig_pos], axis=0)
-        # Bonds only within protein; horizon + clash for full system (no protein–ligand bonds)
-        grad = grad_full(
-            combined,
-            z_list,
-            include_bonds=False,
-            include_horizon=True,
-            **gkw,
-        )
-        grad[:n_bb] += grad_bonds_only(pos_bb, include_clash=False)
+        if use_qc:
+            grad = np.zeros_like(combined)
+            grad[n_bb:] = w_clash * grad_qc_soft_clash_protein_fixed(pos_bb, lig_pos, sigma)
+        else:
+            # Bonds only within protein; horizon + clash for full system (no protein–ligand bonds)
+            grad = grad_full(
+                combined,
+                z_list,
+                include_bonds=False,
+                include_horizon=True,
+                **gkw,
+            )
+            grad[:n_bb] += grad_bonds_only(pos_bb, include_clash=False)
         for lig, indices in zip(ligands, indices_per_ligand):
             F, T = rigid_body_force_torque(combined, grad, indices)
             t, euler = lig.get_6dof()
@@ -572,6 +596,9 @@ def refine_ligands_on_multichain_results(
     ligand_refine_steps: int = LIGAND_REFINE_STEPS,
     ligand_step_t: float = LIGAND_STEP_T,
     ligand_step_ang: float = LIGAND_STEP_ANG,
+    ligand_refinement_mode: str = "lean_qc",
+    qc_soft_clash_sigma: float = LIGAND_QC_SOFT_SIGMA,
+    qc_clash_weight: float = LIGAND_QC_CLASH_WEIGHT,
 ) -> None:
     """
     Place ligand centroid at the merged-complex backbone COM, then 6-DOF horizon refinement
@@ -596,6 +623,9 @@ def refine_ligands_on_multichain_results(
         step_t=ligand_step_t,
         step_ang=ligand_step_ang,
         grad_full_kwargs=grad_full_kwargs,
+        ligand_refinement_mode=str(ligand_refinement_mode),
+        qc_soft_clash_sigma=float(qc_soft_clash_sigma),
+        qc_clash_weight=float(qc_clash_weight),
     )
 
 
@@ -624,95 +654,6 @@ def pdb_hetatm_lines_for_ligands(
             lines.append(line[:80] if len(line) > 80 else line)
             atom_id += 1
     return lines, atom_id
-
-
-def _apply_post_full_heavy_osh(
-    out: Dict[str, object],
-    seq: str,
-    *,
-    em_scale: float,
-    fast_local_theta: bool,
-    kwargs: Optional[Dict[str, Any]],
-) -> None:
-    """
-    Optional overlay: full heavy-atom OSH after fast Cα minimization.
-
-    Mutates ``out`` in place: updates ``ca_min``, ``backbone_atoms``, sets ``full_heavy_chain`` and
-    ``full_heavy_osh_info``. ``full_chain_to_pdb`` emits all-atom protein when ``full_heavy_chain`` is set.
-    """
-    import inspect
-
-    from .full_atom_topology import build_full_heavy_chain
-    from .osh_oracle_full_atom import minimize_full_heavy_with_osh_oracle
-
-    u = dict(kwargs or {})
-    inc_sc = bool(u.pop("include_sidechain_heavy", True))
-    ca_min = np.asarray(out["ca_min"], dtype=float)
-    chain = build_full_heavy_chain(seq, ca_min, include_sidechain_heavy=inc_sc)
-    e_kw = dict(u.pop("energy_kwargs", {}))
-    if fast_local_theta:
-        e_kw.setdefault("fast_local_theta", True)
-    if abs(float(em_scale) - 1.0) > 1e-12:
-        e_kw.setdefault("em_scale", float(em_scale))
-
-    sig = inspect.signature(minimize_full_heavy_with_osh_oracle)
-    skip = frozenset(
-        {
-            "pos_init",
-            "z",
-            "bond_edges",
-            "residue_ranges",
-            "ca_atom_indices",
-            "energy_kwargs",
-        }
-    )
-    mh: Dict[str, Any] = {}
-    for k in list(u.keys()):
-        if k in sig.parameters and k not in skip:
-            mh[k] = u.pop(k)
-    if u:
-        raise TypeError(
-            "post_full_heavy_osh_kwargs: unknown keys: " + ", ".join(sorted(u.keys()))
-        )
-
-    n_res = len(seq)
-    mh.setdefault("z_shell", 6)
-    mh.setdefault("n_iter", 200)
-    mh.setdefault("step_size", 0.02)
-    mh.setdefault("gate_mix", 0.55)
-    mh.setdefault("ansatz_depth", 2)
-    mh.setdefault("use_energy_reservoir", True)
-    mh.setdefault("reservoir_init", 40.0)
-    mh.setdefault("reservoir_gain_scale", 1.2)
-    mh.setdefault("harmonic_max_dims", min(240, max(72, 12 * n_res)))
-    mh.setdefault("backbone_projection_passes", 3)
-    mh["energy_kwargs"] = e_kw
-    # Full-atom physics should couple to Cα by default; optional ``freeze_ca_positions=True`` pins
-    # the trace (side-chain-only). Without a pin, cap per-iter Cα motion so projection + OSH steps
-    # do not explode the backbone (pass ``limit_ca_displacement_ang=None`` to disable).
-    if mh.get("freeze_ca_positions") is not True:
-        mh.setdefault("limit_ca_displacement_ang", 0.22)
-
-    pos1, info = minimize_full_heavy_with_osh_oracle(
-        chain.copy_positions(),
-        chain.z,
-        chain.bond_edges,
-        chain.residue_ranges,
-        chain.ca_atom_indices,
-        **mh,
-    )
-    chain.positions[:] = pos1
-    out["ca_min"] = chain.positions[np.asarray(chain.ca_atom_indices, dtype=int)].copy()
-    out["backbone_atoms"] = _place_full_backbone(out["ca_min"], seq)
-    out["full_heavy_chain"] = chain
-    out["full_heavy_osh_info"] = {
-        "accepted_steps": int(info.accepted_steps),
-        "iterations_executed": int(info.iterations_executed),
-        "final_energy_ev": float(info.final_energy_ev),
-        "stop_reason": str(info.stop_reason),
-        "settled": bool(info.settled),
-        "n_atoms": int(chain.positions.shape[0]),
-    }
 
 
 def minimize_full_chain(
@@ -751,6 +692,12 @@ def minimize_full_chain(
     post_extrusion_langevin_noise_fraction: float = 0.2,
     post_extrusion_max_disp_floor: float = 0.25,
     post_extrusion_max_rounds: int = 32,
+    post_extrusion_osh_hqiv_native: bool = False,
+    post_extrusion_osh_n_iter: int = 120,
+    post_extrusion_osh_step_size: float = 0.03,
+    post_extrusion_osh_ansatz_depth: int = 2,
+    post_extrusion_osh_gate_mix: float = 0.55,
+    post_extrusion_osh_hqiv_reference_m: int = 4,
     fast_pass_steps_per_connection: int = 5,
     min_pass_iter_per_connection: int = 15,
     tunnel_axis: Optional[np.ndarray] = None,
@@ -820,8 +767,9 @@ def minimize_full_chain(
     ligand_refine_steps: int = LIGAND_REFINE_STEPS,
     ligand_step_t: float = LIGAND_STEP_T,
     ligand_step_ang: float = LIGAND_STEP_ANG,
-    post_full_heavy_osh: bool = False,
-    post_full_heavy_osh_kwargs: Optional[Dict[str, Any]] = None,
+    ligand_refinement_mode: str = "lean_qc",
+    qc_soft_clash_sigma: float = LIGAND_QC_SOFT_SIGMA,
+    qc_clash_weight: float = LIGAND_QC_CLASH_WEIGHT,
 ) -> Dict[str, object]:
     """
     Full-chain minimization: minimize E_tot over Cα, then rebuild backbone.
@@ -862,6 +810,8 @@ def minimize_full_chain(
         post_extrusion_langevin_noise_fraction: Scales RMS of Gaussian noise vs ``step_size`` in thermal relax.
         post_extrusion_max_disp_floor: (``hke`` mode only) Minimum motion threshold (Å) for stopping post-extrusion iterations.
         post_extrusion_max_rounds: (``hke`` mode only) Safety cap on outer rounds (each runs one ``_minimize_bonds_fast`` collapse+refine).
+        post_extrusion_osh_hqiv_native: After EM/tree-torque or HKE post-extrusion (when mode is not ``none``), run ``minimize_ca_with_osh_oracle`` with Lean HQIV-native π-phase sparse gates (``OSHoracleHQIVNative``).
+        post_extrusion_osh_n_iter / _step_size / _ansatz_depth / _gate_mix / _hqiv_reference_m: Pass-through to that OSHoracle refine.
         fast_pass_steps_per_connection: Co-translational rigid-group + bell gradient steps per segment (set 0 to skip).
         min_pass_iter_per_connection: L-BFGS iterations per segment in the tunnel (connection-triggered “HKE” pass; set 0 to skip).
         tunnel_axis: (3,) unit vector for tunnel axis; default +Z. Chain is aligned so N-terminus is at origin and extrusion is along this axis.
@@ -903,16 +853,11 @@ def minimize_full_chain(
         inertial_twist_theta_ref_rad: Reference local bend angle (rad) for inertial twist term.
         inertial_twist_exponent: Shape exponent for center-heavy weighting profile.
         ligand_refine_steps, ligand_step_t, ligand_step_ang: Rigid-body refinement of ligands when
-            ``include_ligands`` is True (``grad_full`` uses same ``em_scale`` as the backbone; ``hbond_weight`` is forced off).
-        post_full_heavy_osh: If True, run full heavy-atom OSH (:func:`~.osh_oracle_full_atom.minimize_full_heavy_with_osh_oracle`)
-            on top of the minimized Cα trace (portable descent overlay). Updates ``ca_min``, ``backbone_atoms``,
-            sets ``full_heavy_chain`` and ``full_heavy_osh_info``; :func:`full_chain_to_pdb` writes all-atom protein.
-        post_full_heavy_osh_kwargs: Passed to the overlay; may include ``include_sidechain_heavy``, ``energy_kwargs``,
-            ``freeze_ca_positions``, ``limit_ca_displacement_ang``, and any keyword accepted by
-            ``minimize_full_heavy_with_osh_oracle``. By default Cα is **not** frozen so horizon and heavy-atom
-            terms co-minimize with the backbone; ``limit_ca_displacement_ang`` defaults to ~0.22 Å per iteration
-            (unless ``freeze_ca_positions=True``). Pass ``limit_ca_displacement_ang=None`` for no cap.
-            Unknown keys raise ``TypeError``. Default ``energy_kwargs`` inherit ``fast_local_theta`` and ``em_scale``.
+            ``include_ligands`` is True. Default ``ligand_refinement_mode="lean_qc"`` matches Lean
+            ``ProteinQCRefinement`` (soft clash). Use ``"horizon"`` for legacy ``grad_full`` screening
+            (``hbond_weight`` forced off).
+        ligand_refinement_mode: ``lean_qc`` (default) or ``horizon``.
+        qc_soft_clash_sigma, qc_clash_weight: Lean QC soft-clash distance scale (Å) and weight (only for ``lean_qc``).
 
     Returns:
         dict with:
@@ -923,8 +868,6 @@ def minimize_full_chain(
           info: from minimize_e_tot_lbfgs (e_final, e_initial, n_iter, success, message).
           n_res: number of residues.
           sequence: sequence used.
-          full_heavy_chain: optional :class:`~.full_atom_topology.FullHeavyAtomChain` when ``post_full_heavy_osh`` is True.
-          full_heavy_osh_info: optional dict (accepted steps, stop reason, …) when overlay ran.
     """
     seq = sequence.strip().upper()
     if not seq or not all(c in AA_1to3 for c in seq):
@@ -1277,6 +1220,31 @@ def minimize_full_chain(
                         "post_extrusion_refine_mode": "em_treetorque",
                         **{k: v for k, v in em_tt_info.items() if k != "message"},
                     }
+                if bool(post_extrusion_osh_hqiv_native) and mode != "none":
+                    from .osh_oracle_folding import minimize_ca_with_osh_oracle
+
+                    ca_min, osh_info = minimize_ca_with_osh_oracle(
+                        ca_min,
+                        sequence=seq,
+                        z_shells=np.asarray(z_ca, dtype=np.int32),
+                        z_shell=int(z_ca.flat[0]) if z_ca.size else 6,
+                        n_iter=int(post_extrusion_osh_n_iter),
+                        step_size=float(post_extrusion_osh_step_size),
+                        ansatz_depth=int(post_extrusion_osh_ansatz_depth),
+                        gate_mix=float(post_extrusion_osh_gate_mix),
+                        use_energy_reservoir=False,
+                        use_hqiv_native_gate=True,
+                        hqiv_reference_m=int(post_extrusion_osh_hqiv_reference_m),
+                        energy_kwargs=dict(_gf_kw),
+                    )
+                    current_for_dump["ca"] = ca_min.copy()
+                    info = {
+                        **info,
+                        "post_extrusion_osh_hqiv_native": True,
+                        "osh_oracle_accepted_steps": int(osh_info.accepted_steps),
+                        "osh_oracle_final_energy_ev": float(osh_info.final_energy_ev),
+                        "osh_oracle_iterations_executed": int(osh_info.iterations_executed),
+                    }
             elif traj_file is not None:
                 write_trajectory_frame(traj_file, 0, ca_min)
         # Standard HKE path (unchanged): fast path for long chains or L-BFGS for short
@@ -1492,28 +1460,6 @@ def minimize_full_chain(
         if side_chain_pack:
             backbone_atoms = _side_chain_pack_light(backbone_atoms, seq)
 
-    post_osh_chain: Optional[object] = None
-    post_osh_info: Optional[Dict[str, Any]] = None
-    if post_full_heavy_osh:
-        pho: Dict[str, object] = {
-            "ca_min": np.asarray(ca_min, dtype=float).copy(),
-            "backbone_atoms": backbone_atoms,
-        }
-        _apply_post_full_heavy_osh(
-            pho,
-            seq,
-            em_scale=float(em_scale),
-            fast_local_theta=bool(fast_local_theta),
-            kwargs=post_full_heavy_osh_kwargs,
-        )
-        ca_min = np.asarray(pho["ca_min"], dtype=float)
-        backbone_atoms = pho["backbone_atoms"]  # type: ignore[assignment]
-        pos_bb, z_bb = _full_backbone_positions_and_z(backbone_atoms)
-        E_ca_final = float(e_tot(ca_min, z_ca))
-        E_backbone_final = float(e_tot(pos_bb, z_bb))
-        post_osh_chain = pho.get("full_heavy_chain")
-        post_osh_info = pho.get("full_heavy_osh_info")  # type: ignore[assignment]
-
     ligand_list: Optional[List[LigandAgent]] = None
     if include_ligands and ligands:
         pos_bb, z_bb = _full_backbone_positions_and_z(backbone_atoms)
@@ -1530,9 +1476,12 @@ def minimize_full_chain(
             step_t=float(ligand_step_t),
             step_ang=float(ligand_step_ang),
             grad_full_kwargs=dict(_gf_kw),
+            ligand_refinement_mode=str(ligand_refinement_mode),
+            qc_soft_clash_sigma=float(qc_soft_clash_sigma),
+            qc_clash_weight=float(qc_clash_weight),
         )
 
-    out: Dict[str, Any] = {
+    out = {
         "ca_min": ca_min,
         "backbone_atoms": backbone_atoms,
         "E_ca_final": E_ca_final,
@@ -1544,10 +1493,6 @@ def minimize_full_chain(
     }
     if ligand_list is not None:
         out["ligands"] = ligand_list
-    if post_osh_chain is not None:
-        out["full_heavy_chain"] = post_osh_chain
-    if post_osh_info is not None:
-        out["full_heavy_osh_info"] = post_osh_info
     return out
 
 
@@ -1888,34 +1833,19 @@ def full_chain_to_pdb(
     chain_id: str = "A",
     ligands: Optional[List[LigandAgent]] = None,
     ligand_chain_id: Optional[str] = None,
+    *,
+    model_step: Optional[int] = None,
 ) -> str:
-    """Format minimizer result as PDB string (MODEL 1 ... ENDMDL END). Protein ATOM records then ligand HETATM if ligands provided."""
-    fhc = result.get("full_heavy_chain")
+    """Format minimizer result as PDB string (REMARK HQIV-QConSi-*-step + MODEL ... ENDMDL END). Protein ATOM then ligand HETATM if provided."""
     backbone_atoms = result["backbone_atoms"]
     sequence = result["sequence"]
     include_sidechains = result.get("include_sidechains", False)
     if ligands is None:
         ligands = result.get("ligands") or []
-    if not backbone_atoms and not ligands and fhc is None:
-        return "MODEL     1\nENDMDL\nEND\n"
-    if fhc is not None:
-        from .full_atom_topology import chain_to_pdb_line_string
-
-        if not ligands:
-            return chain_to_pdb_line_string(fhc, chain_id=chain_id)
-        base_lines = [
-            ln for ln in chain_to_pdb_line_string(fhc, chain_id=chain_id).split("\n") if ln.strip()
-        ]
-        while base_lines and base_lines[-1].strip() in ("END", "ENDMDL"):
-            base_lines.pop()
-        start_id = int(fhc.positions.shape[0]) + 1
-        het_chain = ligand_chain_id if ligand_chain_id is not None else chain_id
-        het_lines, _ = pdb_hetatm_lines_for_ligands(
-            list(ligands), start_atom_id=start_id, ligand_chain_id=het_chain
-        )
-        return "\n".join(base_lines + het_lines + ["ENDMDL", "END"])
+    if not backbone_atoms and not ligands:
+        return hqiv_qconsi_empty_pdb_block(step=model_step)
     het_chain = ligand_chain_id if ligand_chain_id is not None else chain_id
-    lines = ["MODEL     1"]
+    lines = list(hqiv_qconsi_model_lines(step=model_step))
     atom_id = 1
     n_res = result["n_res"]
     idx = 0
@@ -1957,9 +1887,11 @@ def full_chain_to_pdb_complex(
     sequence_b: str,
     chain_id_a: str = "A",
     chain_id_b: str = "B",
+    *,
+    model_step: Optional[int] = None,
 ) -> str:
-    """Format two backbones as one PDB (MODEL 1) with chain A then chain B."""
-    lines = ["MODEL     1"]
+    """Format two backbones as one PDB (HQIV-QConSi header) with chain A then chain B."""
+    lines = list(hqiv_qconsi_model_lines(step=model_step))
     atom_id = 1
     for chain_idx, (backbone, sequence, chain_id) in enumerate([
         (backbone_a, sequence_a, chain_id_a),

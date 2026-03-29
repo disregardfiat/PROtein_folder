@@ -16,6 +16,8 @@ POST /predict with body = FASTA or form/JSON (sequence=, title=, email=).
 If "email" param is set and SMTP is configured, also sends PDB by email.
 GET /health → 200 OK.
 
+**PDB model line:** ``REMARK 999 HQIV-QConSi-<n>-step`` plus ``MODEL <n>`` (not plain ``MODEL 1``). Set ``CASP_PDB_QCONSI_STEP`` for ``<n>`` (default ``1``).
+
 Env: SMTP_* for email; SMTP_CC_TO to CC when not recipient; CASP_OUTPUT_DIR (default ./casp_results)
 for pending/ and outputs/; USE_FAST_PREDICT=1 to skip main pass (fast PDB only); PREDICTION_TIMEOUT_SEC
 (default 3600); CASP_MAX_CONCURRENT_JOBS (default 2); CASP_KNOWN_TARGETS_CACHE (optional) for known
@@ -26,6 +28,10 @@ CASP_LEAN_DISCRETE_SEED (optional int), CASP_LEAN_POST_ANNEAL=1 (short multi-K M
 CASP_LEAN_POST_ANNEAL_SCHEDULE=348,330,318,310 (optional comma-separated K, ≥2 values),
 CASP_LEAN_POST_LANGEVIN_STEPS, CASP_LEAN_LANGEVIN_NOISE_FRAC.
 In-tunnel thermal gradient: CASP_LEAN_TUNNEL_THERMAL_STEPS (default 0), CASP_LEAN_TUNNEL_THERMAL_NOISE_FRAC, CASP_LEAN_TUNNEL_THERMAL_SEED (optional).
+**HQIV-native OSHoracle** (Lean ``OSHoracleHQIVNative``): enabled by default after EM/tree-torque; set ``CASP_LEAN_OSH_HQIV_NATIVE=0`` to disable. Optional: ``CASP_LEAN_OSH_N_ITER``, ``CASP_LEAN_OSH_STEP_SIZE``, ``CASP_LEAN_OSH_ANSATZ_DEPTH``, ``CASP_LEAN_OSH_GATE_MIX``, ``CASP_LEAN_OSH_HQIV_REFERENCE_M``.
+
+**Ligand refinement (Lean ``ProteinQCRefinement`` soft clash):** default ``CASP_LEAN_LIGAND_REFINEMENT_MODE=lean_qc``; set to ``horizon`` for legacy ``grad_full`` rigid-body steps. Optional: ``CASP_LEAN_QC_SOFT_CLASH_SIGMA`` (Å), ``CASP_LEAN_QC_CLASH_WEIGHT``.
+**Ligand rigid-body steps:** main jobs use ``CASP_LEAN_LIGAND_REFINE_STEPS`` (default **150**). Fast-pass uses ``CASP_LEAN_FAST_LIGAND_REFINE_STEPS`` (default **50**).
 
 Run from repo root: gunicorn -w 1 -b 127.0.0.1:8050 casp_server:app
 """
@@ -74,6 +80,7 @@ from horizon_physics.proteins.full_protein_minimizer import (
 from horizon_physics.proteins.ligands import parse_ligands
 from horizon_physics.proteins.hqiv_lean_folding import PHYSIOLOGICAL_PH
 from horizon_physics.proteins.lean_ribosome_tunnel_pipeline import fold_lean_ribosome_tunnel
+from horizon_physics.proteins.pdb_hqiv_header import hqiv_qconsi_empty_pdb_block, hqiv_qconsi_model_lines
 from horizon_physics.proteins.hierarchical import (
     minimize_full_chain_hierarchical,
     hierarchical_result_for_pdb,
@@ -217,6 +224,9 @@ def _lean_fold_env_kwargs(quick: bool) -> dict:
     post_anneal = os.environ.get("CASP_LEAN_POST_ANNEAL", "").strip().lower() in ("1", "true", "yes")
     anneal_sched = _comma_float_tuple("CASP_LEAN_POST_ANNEAL_SCHEDULE")
 
+    _osh_raw = os.environ.get("CASP_LEAN_OSH_HQIV_NATIVE", "").strip().lower()
+    post_extrusion_osh_hqiv_native = False if _osh_raw in ("0", "false", "no") else True
+
     tunnel_th_seed: int | None = None
     _tth_seed_s = os.environ.get("CASP_LEAN_TUNNEL_THERMAL_SEED", "").strip()
     if _tth_seed_s:
@@ -224,6 +234,12 @@ def _lean_fold_env_kwargs(quick: bool) -> dict:
             tunnel_th_seed = int(_tth_seed_s)
         except ValueError:
             tunnel_th_seed = None
+
+    # Ligand 6-DOF refinement: full CASP jobs get a generous default (not capped at 40).
+    if quick:
+        ligand_refine_steps = _i("CASP_LEAN_FAST_LIGAND_REFINE_STEPS", 50)
+    else:
+        ligand_refine_steps = _i("CASP_LEAN_LIGAND_REFINE_STEPS", 150)
 
     return {
         "temperature_k": _f("CASP_LEAN_TEMPERATURE_K", 310.0),
@@ -246,11 +262,24 @@ def _lean_fold_env_kwargs(quick: bool) -> dict:
         "post_extrusion_langevin_steps": _i("CASP_LEAN_POST_LANGEVIN_STEPS", 0),
         "post_extrusion_langevin_noise_fraction": _f("CASP_LEAN_LANGEVIN_NOISE_FRAC", 0.2),
         "post_extrusion_max_rounds": post_rounds,
+        "post_extrusion_osh_hqiv_native": post_extrusion_osh_hqiv_native,
+        "post_extrusion_osh_n_iter": _i("CASP_LEAN_OSH_N_ITER", 120),
+        "post_extrusion_osh_step_size": _f("CASP_LEAN_OSH_STEP_SIZE", 0.03),
+        "post_extrusion_osh_ansatz_depth": _i("CASP_LEAN_OSH_ANSATZ_DEPTH", 2),
+        "post_extrusion_osh_gate_mix": _f("CASP_LEAN_OSH_GATE_MIX", 0.55),
+        "post_extrusion_osh_hqiv_reference_m": _i("CASP_LEAN_OSH_HQIV_REFERENCE_M", 4),
         "fast_pass_steps_per_connection": fpc,
         "min_pass_iter_per_connection": mpc,
         "hbond_weight": _f("CASP_LEAN_HBOND_WEIGHT", 0.0),
         "hbond_shell_m": _i("CASP_LEAN_HBOND_SHELL_M", 3),
-        "ligand_refine_steps": _i("CASP_LEAN_LIGAND_REFINE_STEPS", 40),
+        "ligand_refine_steps": ligand_refine_steps,
+        "ligand_refinement_mode": (
+            (lambda m: m if m in ("lean_qc", "horizon") else "lean_qc")(
+                (os.environ.get("CASP_LEAN_LIGAND_REFINEMENT_MODE") or "lean_qc").strip().lower()
+            )
+        ),
+        "qc_soft_clash_sigma": _f("CASP_LEAN_QC_SOFT_CLASH_SIGMA", 3.0),
+        "qc_clash_weight": _f("CASP_LEAN_QC_CLASH_WEIGHT", 1.0),
     }
 
 
@@ -1868,7 +1897,7 @@ def _predict_lean_assembly(
         cid = chain_ids[i] if i < len(chain_ids) else "A"
         results.append((out.raw_result, cid))
     if not results:
-        return "MODEL     1\nENDMDL\nEND\n"
+        return hqiv_qconsi_empty_pdb_block()
     return _merge_pdb_chains(
         results,
         ligands=parsed_ligands or None,
@@ -2037,7 +2066,7 @@ def _merge_pdb_chains(
     ligand_refine_steps: int | None = None,
 ) -> str:
     """
-    Merge multiple (result, chain_id) into one PDB (MODEL 1) with renumbered atom IDs.
+    Merge multiple (result, chain_id) into one PDB (HQIV-QConSi REMARK + MODEL) with renumbered atom IDs.
     Offsets each chain along +x. Optional ligands: Lean-screened 6-DOF refinement vs merged backbone, then HETATM.
     """
     from horizon_physics.proteins.casp_submission import AA_1to3
@@ -2051,7 +2080,7 @@ def _merge_pdb_chains(
             continue
         min_x = min(float(xyz[0]) for _, xyz in backbone_atoms)
         chain_mins.append(min_x)
-    lines = ["MODEL     1"]
+    lines = list(hqiv_qconsi_model_lines())
     atom_id = 1
     prev_max_x = float("-inf")
     for ci, (result, chain_id) in enumerate(result_and_chain_ids):
@@ -2093,6 +2122,9 @@ def _merge_pdb_chains(
                 lcopy,
                 grad_full_kwargs=_lean_grad_full_kwargs_for_ligand_refine(quick=ligand_refine_quick),
                 ligand_refine_steps=steps,
+                ligand_refinement_mode=str(kw_lean.get("ligand_refinement_mode", "lean_qc")),
+                qc_soft_clash_sigma=float(kw_lean.get("qc_soft_clash_sigma", 3.0)),
+                qc_clash_weight=float(kw_lean.get("qc_clash_weight", 1.0)),
             )
         het_c = (ligand_chain_id or os.environ.get("CASP_LIGAND_CHAIN_ID") or "L").strip() or "L"
         het_lines, atom_id = pdb_hetatm_lines_for_ligands(
@@ -2139,12 +2171,12 @@ def _predict_hke_assembly_multichain(sequences: list[str], parsed_ligands: list 
     seqs = [_sequence_from_input(s) for s in sequences]
     seqs = [s for s in seqs if s]
     if not seqs:
-        return "MODEL     1\nENDMDL\nEND\n"
+        return hqiv_qconsi_empty_pdb_block()
     if len(seqs) == 1:
         pdb, _ = _predict_hke_single(
             seqs[0], ligands=parsed_ligands if parsed_ligands else None
         )
-        return pdb or "MODEL     1\nENDMDL\nEND\n"
+        return pdb or hqiv_qconsi_empty_pdb_block()
     if len(seqs) == 2:
         # Prefer full EM-field assembly cycle (HKE + assembly-mode tree-torque + HKE + tree-torque)
         if assembly_hke_treetorque_cycle_two_chains is not None and run_discrete_refinement is not None:
@@ -2530,7 +2562,9 @@ Prediction algorithm (default: HQIV Lean ribosome tunnel + bulk solvent)
 
 1) Initial fold (default)
    Single chain: co-translational ribosome tunnel with Lean-aligned ε_r(T), pH
-   screening, dihedral bias toward the HQIV α basin, post-extrusion refine; optional
+   screening, dihedral bias toward the HQIV α basin, post-extrusion EM + tree-torque,
+   then (by default) an HQIV-native sparse OSHoracle π-phase gate refine on Cα
+   (Lean ``OSHoracleHQIVNative``; disable with CASP_LEAN_OSH_HQIV_NATIVE=0); optional
    ligands as 6-DOF rigid bodies (included in the tunnel fold for single chain).
    Multi-chain: each chain folded the same way, merged with a chain–chain offset; ligands
    (if provided) are refined against the **entire** merged complex backbone with the same

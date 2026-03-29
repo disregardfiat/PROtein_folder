@@ -21,6 +21,7 @@ src/*.egg-info/
 .installed.cfg
 *.egg
 .casp*
+gunicorn.ctl
 
 # Virtual envs and server config (real SMTP etc.)
 .env

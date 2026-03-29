@@ -3,13 +3,15 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from horizon_physics.proteins.full_atom_topology import build_full_heavy_chain
 from horizon_physics.proteins.osh_oracle_backbone import minimize_backbone_with_osh_oracle
-from horizon_physics.proteins.osh_oracle_full_atom import minimize_full_heavy_with_osh_oracle
 from horizon_physics.proteins.osh_oracle_folding import (
+    REFERENCE_M_HQIV_NATIVE,
     auto_detect_cys_ligation_pairs,
     amplify_low_energy,
     apply_gate_sparse,
+    apply_gate_sparse_hqiv_native,
+    hqiv_harmonic_flat_index_ell_m0,
+    hqiv_pivot_from_shells,
     contact_reflector_indices,
     per_residue_terminus_step_scale,
     compute_tunnel_harmonic_budget_ev,
@@ -22,18 +24,15 @@ from horizon_physics.proteins.osh_oracle_folding import (
     harmonic_tunneled_qaoa_folding,
     qpe_low_energy_subspace,
     minimize_ca_with_osh_oracle,
+    minimize_ca_with_osh_oracle_additive_cycles,
     metropolis_accept_with_harmonic,
+    _local_rapidity_displacement,
     prune_to_flipped,
     sparse_visible_energy,
     sparse_basis_card,
     wrap_idx,
 )
-from horizon_physics.proteins.pipeline_interchange import (
-    FoldState,
-    make_full_heavy_osh_stage,
-    make_osh_oracle_stage,
-    run_pipeline,
-)
+from horizon_physics.proteins.pipeline_interchange import FoldState, make_osh_oracle_stage, run_pipeline
 
 
 def test_sparse_primitives_follow_lean_shape():
@@ -45,6 +44,52 @@ def test_sparse_primitives_follow_lean_shape():
     assert len(expd) == 2 * len(reg)
     out = apply_gate_sparse(L, reg, gate_mix=0.5)
     assert len(out) == 2 * len(reg)
+
+
+def test_hqiv_native_pivot_and_phase_preserves_norm_sq():
+    L = 3
+    shells = np.array([1, 2, 3], dtype=np.int64)
+    pv = hqiv_pivot_from_shells(shells, L, reference_m=REFERENCE_M_HQIV_NATIVE)
+    assert pv == (int(np.sum(shells)) + REFERENCE_M_HQIV_NATIVE) % (L + 1)
+    fi = hqiv_harmonic_flat_index_ell_m0(L, pv)
+    assert 0 <= fi < sparse_basis_card(L)
+    reg = [(0, 1.0), (2, 0.5)]
+    out = apply_gate_sparse_hqiv_native(L, reg, shells, reference_m=REFERENCE_M_HQIV_NATIVE)
+    assert len(out) == 2 * len(reg)
+    # π phase on one mode preserves Euclidean norm of the dense intermediate.
+    from horizon_physics.proteins.osh_oracle_folding import (
+        _hqiv_phase_negate_one_mode,
+        dense_of_sparse,
+    )
+
+    expd = causal_expand_support(L, reg)
+    dense = dense_of_sparse(L, expd)
+    fi = hqiv_harmonic_flat_index_ell_m0(L, pv)
+    evolved = _hqiv_phase_negate_one_mode(dense, fi)
+    assert abs(float(np.sum(dense * dense)) - float(np.sum(evolved * evolved))) < 1e-9
+
+
+def test_minimize_ca_with_hqiv_native_gate_smoke():
+    ca0 = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [3.8, 0.2, 0.0],
+            [7.7, -0.1, 0.1],
+            [11.5, 0.3, -0.2],
+            [15.2, 0.0, 0.3],
+        ],
+        dtype=float,
+    )
+    ca1, info = minimize_ca_with_osh_oracle(
+        ca0,
+        n_iter=12,
+        step_size=0.02,
+        ansatz_depth=3,
+        use_hqiv_native_gate=True,
+        hqiv_reference_m=REFERENCE_M_HQIV_NATIVE,
+    )
+    assert ca1.shape == ca0.shape
+    assert info.iterations_executed <= info.iterations
 
 
 def test_detect_and_prune_support():
@@ -91,101 +136,6 @@ def test_minimize_backbone_with_osh_oracle_smoke():
     assert info.last_step_size > 0.0
 
 
-def test_minimize_full_heavy_with_osh_oracle_smoke():
-    seq = "GE"  # Gly, Glu — exercises gap and side chain
-    ca = np.array([[0.0, 0.0, 0.0], [3.8, 0.1, 0.0]], dtype=float)
-    ch = build_full_heavy_chain(seq, ca, include_sidechain_heavy=True)
-    pos2, info = minimize_full_heavy_with_osh_oracle(
-        ch.copy_positions(),
-        ch.z,
-        ch.bond_edges,
-        ch.residue_ranges,
-        ch.ca_atom_indices,
-        n_iter=8,
-        step_size=0.02,
-        ansatz_depth=2,
-        use_energy_reservoir=False,
-        energy_kwargs={"fast_local_theta": True, "include_clash": False},
-    )
-    assert pos2.shape == ch.positions.shape
-    assert info.iterations_executed <= info.iterations
-
-
-def test_minimize_full_heavy_limit_ca_caps_step():
-    """Without freeze, limit_ca_displacement_ang bounds per-iter Cα motion vs previous state."""
-    seq = "GE"
-    ca = np.array([[0.0, 0.0, 0.0], [3.8, 0.1, 0.0]], dtype=float)
-    ch = build_full_heavy_chain(seq, ca, include_sidechain_heavy=True)
-    pos0 = ch.copy_positions()
-    pos1, info = minimize_full_heavy_with_osh_oracle(
-        pos0,
-        ch.z,
-        ch.bond_edges,
-        ch.residue_ranges,
-        ch.ca_atom_indices,
-        n_iter=25,
-        step_size=0.04,
-        ansatz_depth=2,
-        use_energy_reservoir=True,
-        reservoir_init=60.0,
-        backbone_projection_passes=4,
-        freeze_ca_positions=False,
-        limit_ca_displacement_ang=0.05,
-        energy_kwargs={"fast_local_theta": True, "include_clash": False},
-    )
-    assert info.iterations_executed >= 1
-    ca_out = pos1[np.asarray(ch.ca_atom_indices, dtype=int)]
-    max_disp = float(np.max(np.linalg.norm(ca_out - ca, axis=1)))
-    assert np.isfinite(max_disp)
-    assert max_disp < 4.0
-
-
-def test_minimize_full_heavy_freeze_ca_holds_experimental_ca():
-    """Cα must not drift when freeze_ca_positions pins to ca_target (bond projection otherwise moves CA)."""
-    seq = "GE"
-    ca = np.array([[0.0, 0.0, 0.0], [3.8, 0.1, 0.0]], dtype=float)
-    ch = build_full_heavy_chain(seq, ca, include_sidechain_heavy=True)
-    pos0 = ch.copy_positions()
-    pos1, info = minimize_full_heavy_with_osh_oracle(
-        pos0,
-        ch.z,
-        ch.bond_edges,
-        ch.residue_ranges,
-        ch.ca_atom_indices,
-        n_iter=40,
-        step_size=0.025,
-        ansatz_depth=2,
-        use_energy_reservoir=True,
-        reservoir_init=80.0,
-        backbone_projection_passes=4,
-        freeze_ca_positions=True,
-        energy_kwargs={
-            "fast_local_theta": True,
-            "include_clash": False,
-            "ca_target": ca.copy(),
-            "k_ca_target": 50.0,
-        },
-    )
-    ca_out = pos1[np.asarray(ch.ca_atom_indices, dtype=int)]
-    assert np.max(np.linalg.norm(ca_out - ca, axis=1)) < 1e-6
-    assert info.iterations_executed >= 1
-
-
-def test_backbone_ca_target_restraint_holds_ca():
-    from horizon_physics.proteins.casp_submission import _place_full_backbone
-    from horizon_physics.proteins.folding_energy import grad_ca_target_restraint
-
-    seq = "ACE"
-    ca = np.array([[i * 3.8, 0.0, 0.0] for i in range(len(seq))], dtype=float)
-    pos = np.array([xyz for _, xyz in _place_full_backbone(ca, seq)], dtype=float)
-    g0 = grad_ca_target_restraint(pos, len(seq), ca, 2.0)
-    assert np.allclose(g0[1::4], 0.0, atol=1e-9)
-    pos_b = pos.copy()
-    pos_b[5] += np.array([0.2, 0.0, 0.0])  # CA of middle residue
-    g1 = grad_ca_target_restraint(pos_b, len(seq), ca, 2.0)
-    assert float(g1[5][0]) > 0.0
-
-
 def test_minimize_ca_with_osh_oracle_smoke():
     ca0 = np.array(
         [
@@ -204,6 +154,24 @@ def test_minimize_ca_with_osh_oracle_smoke():
     assert info.last_step_size > 0.0
     assert info.avg_flipped_count >= 0.0
     assert info.natural_harmonic_scale > 0.0
+
+
+def test_minimize_ca_with_additive_cycles_smoke():
+    ca0 = np.array([[3.8 * i, 0.0, 0.0] for i in range(10)], dtype=float)
+    ca1, info, cycles = minimize_ca_with_osh_oracle_additive_cycles(
+        ca0,
+        n_iter=12,
+        max_cycles=2,
+        step_size=0.02,
+        use_energy_reservoir=True,
+        reservoir_init=5.0,
+        additive_kick_gain=0.001,
+        additive_update_every=1,
+    )
+    assert ca1.shape == ca0.shape
+    assert info.iterations_executed <= info.iterations
+    assert len(cycles) >= 1
+    assert cycles[0].reservoir_before_ev >= 0.0
 
 
 def test_harmonic_helpers_and_acceptance():
@@ -228,6 +196,62 @@ def test_harmonic_helpers_and_acceptance():
     )
 
 
+def test_rapidity_displacement_respects_active_subset() -> None:
+    """
+    Rapidity translation is fully computable; when we prune to a sparse active support,
+    the displacement must match the dense computation restricted to that same active set.
+    """
+    rng = np.random.default_rng(1234)
+    n = 8
+    ca = rng.normal(size=(n, 3)).astype(float)
+    grad = rng.normal(size=(n, 3)).astype(float)
+
+    active_idx = np.array([2, 3, 5], dtype=int)  # all interior indices (1..n-2)
+    disp_sparse = _local_rapidity_displacement(
+        ca, grad, active_idx, gain=0.25, tangent_weight=0.7, normal_weight=0.3
+    )
+    disp_dense = _local_rapidity_displacement(
+        ca, grad, np.arange(n, dtype=int), gain=0.25, tangent_weight=0.7, normal_weight=0.3
+    )
+
+    # In sparse mode, inactive indices must not be written at all.
+    for i in range(n):
+        if i in set(active_idx.tolist()):
+            assert np.allclose(disp_sparse[i], disp_dense[i], atol=1e-12, rtol=0.0)
+        else:
+            assert np.allclose(disp_sparse[i], np.zeros(3), atol=1e-12, rtol=0.0)
+
+
+def test_prune_to_flipped_preserves_sparse_energy_when_kept() -> None:
+    """
+    Mirrors the paper's "Flipped support and pruning" lemma:
+    if every active ket in `r` has its index inside `flipped`, pruning must preserve
+    the sparse Euclidean energy on listed amplitudes.
+    """
+    L = 3
+    basis = sparse_basis_card(L)
+
+    rng = np.random.default_rng(42)
+    # Construct an "after" sparse register with explicitly chosen indices.
+    after = [(2, float(rng.normal())), (5, float(rng.normal())), (9, float(rng.normal()))]
+
+    # Case 1: flipped contains all indices in `after` (premise holds).
+    flipped_ok = sorted({2, 5, 9, 13, 1})
+    local_energy = np.ones((basis,), dtype=float)
+    e0 = sparse_visible_energy(after, local_energy)
+    pruned_ok = prune_to_flipped(flipped_ok, after)
+    e1 = sparse_visible_energy(pruned_ok, local_energy)
+    assert pruned_ok == after  # no entries should be removed
+    assert np.isclose(e1, e0, rtol=0.0, atol=1e-12)
+
+    # Case 2: flipped misses one index (premise fails) -> energy should drop.
+    flipped_bad = sorted({2, 5})
+    pruned_bad = prune_to_flipped(flipped_bad, after)
+    assert [i for i, _ in pruned_bad] == [2, 5]
+    e2 = sparse_visible_energy(pruned_bad, local_energy)
+    assert e2 < e0
+
+
 def test_pipeline_stage_runs():
     seq = "MKFLN"
     ca0 = np.array([[3.8 * i, 0.0, 0.0] for i in range(len(seq))], dtype=float)
@@ -243,22 +267,6 @@ def test_pipeline_stage_runs():
     assert out.ca_positions is not None
     assert len(out.stage_history) == 1
     assert out.stage_history[0]["stage"] == "osh_oracle_sparse_refine"
-
-
-def test_full_heavy_osh_pipeline_stage():
-    seq = "GGG"
-    ca0 = np.array([[3.8 * i, 0.0, 0.0] for i in range(len(seq))], dtype=float)
-    s0 = FoldState(sequence=seq, ca_positions=ca0)
-    stage = make_full_heavy_osh_stage(
-        n_iter=6,
-        use_energy_reservoir=False,
-        energy_kwargs={"fast_local_theta": True, "include_clash": False},
-    )
-    out = run_pipeline(s0, [stage])
-    assert out.full_heavy_chain is not None
-    pdb = out.to_pdb()
-    assert "ATOM" in pdb
-    assert out.stage_history[-1]["stage"] == "full_heavy_osh_refine"
 
 
 def test_settle_stop_can_trigger():

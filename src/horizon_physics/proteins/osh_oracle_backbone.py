@@ -77,8 +77,6 @@ def _energy_backbone(
 ) -> float:
     kw = dict(e_kw)
     flt = bool(kw.pop("fast_local_theta", False))
-    ca_tgt = kw.pop("ca_target", None)
-    k_ca_t = float(kw.pop("k_ca_target", 0.0))
     return float(
         e_tot_backbone_with_bonds(
             pos,
@@ -91,8 +89,6 @@ def _energy_backbone(
             r_clash=float(kw.pop("r_clash", R_CLASH)),
             k_clash=float(kw.pop("k_clash", K_CLASH)),
             include_clash=bool(kw.pop("include_clash", True)),
-            ca_target=ca_tgt,
-            k_ca_target=k_ca_t,
         )
     )
 
@@ -105,8 +101,6 @@ def _grad_backbone_for_osh(
 ) -> np.ndarray:
     kw = dict(e_kw)
     kw.pop("fast_local_theta", None)
-    ca_tgt = kw.get("ca_target")
-    k_ca_t = float(kw.get("k_ca_target", 0.0))
     horizon_kw = {
         k: kw[k]
         for k in ("r_ref", "r_horizon", "k_horizon", "em_scale", "use_neighbor_list", "neighbor_cutoff")
@@ -124,8 +118,6 @@ def _grad_backbone_for_osh(
         k_bond=float(kw.get("k_bond", K_BOND)),
         r_clash=float(kw.get("r_clash", R_CLASH)),
         k_clash=float(kw.get("k_clash", K_CLASH)),
-        ca_target=ca_tgt,
-        k_ca_target=k_ca_t,
         **horizon_kw,
     )
 
