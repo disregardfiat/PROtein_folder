@@ -206,8 +206,11 @@ def _lean_fold_env_kwargs(quick: bool) -> dict:
             disc_seed = None
     if quick:
         post_rounds = _i("CASP_LEAN_FAST_POST_EXTRUSION_MAX_ROUNDS", 12)
-        fpc = _i("CASP_LEAN_FAST_FAST_PASS_STEPS", 2)
-        mpc = _i("CASP_LEAN_FAST_MIN_PASS_ITER", 5)
+        # Fast-pass should stay stable: our diagnostics show that enabling
+        # in-tunnel pass work (fast_pass/min_pass) can drastically worsen
+        # global fold topology on hard CASP targets.
+        fpc = _i("CASP_LEAN_FAST_FAST_PASS_STEPS", 0)
+        mpc = _i("CASP_LEAN_FAST_MIN_PASS_ITER", 0)
     else:
         post_rounds = _i("CASP_LEAN_POST_EXTRUSION_MAX_ROUNDS", 32)
         fpc = _i("CASP_LEAN_FAST_PASS_STEPS_PER_CONNECTION", 0)
