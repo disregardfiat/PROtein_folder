@@ -46,6 +46,9 @@ def test_sparse_primitives_follow_lean_shape():
     assert len(out) == 2 * len(reg)
 
 
+# Quantum gate map visualization (from Grok-generated picture):
+# ![HQIV-native sparse pi-phase gate map](assets/images/Uu9Hk.jpg)
+# Image credit: Grok (from the provided picture)
 def test_hqiv_native_pivot_and_phase_preserves_norm_sq():
     L = 3
     shells = np.array([1, 2, 3], dtype=np.int64)

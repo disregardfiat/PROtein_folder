@@ -1079,10 +1079,13 @@
 <p>This software is MIT-licensed <strong>with an additional government-use restriction</strong>. See <a href="government-use/">Government use &amp; license</a> and <a href="https://github.com/disregardfiat/protein_folder/blob/main/GOVERNMENT_USE.md"><code>GOVERNMENT_USE.md</code></a> before deployment.</p>
 </div>
 <h2 id="highlights">Highlights<a class="headerlink" href="#highlights" title="Permanent link">&para;</a></h2>
+<p><img alt="HQIV-native sparse pi-phase gate map" src="assets/images/Uu9Hk.jpg" /></p>
+<p><em>Image credit: Grok (from the provided picture)</em></p>
 <ul>
 <li><strong>Co-translational ribosome tunnel</strong> — null-cone search, lip plane, binary-tree segment scheduling, optional thermal steps (<a href="https://github.com/disregardfiat/protein_folder/blob/main/src/horizon_physics/proteins/lean_ribosome_tunnel_pipeline.py"><code>lean_ribosome_tunnel_pipeline.py</code></a>).</li>
 <li><strong>Analytical horizon gradients</strong> — informational energy and CA+bond models (<a href="https://github.com/disregardfiat/protein_folder/blob/main/src/horizon_physics/proteins/folding_energy.py"><code>folding_energy.py</code></a>).</li>
 <li><strong>Deterministic L-BFGS</strong> and hierarchical / JAX-accelerated paths where enabled (<a href="https://github.com/disregardfiat/protein_folder/blob/main/src/horizon_physics/proteins/full_protein_minimizer.py"><code>full_protein_minimizer.py</code></a>).</li>
+<li><strong>HQIV-native sparse gate + pruning (optional)</strong> — OSHoracle sparse refinement expands sparse support horizon-causally, applies an HQIV-native sparse pi-phase gate evolution, then prunes to only the flipped support before the CA minimization update (<a href="https://github.com/disregardfiat/protein_folder/blob/main/src/horizon_physics/proteins/osh_oracle_folding.py"><code>osh_oracle_folding.py</code></a>, <a href="https://github.com/disregardfiat/protein_folder/blob/main/src/horizon_physics/proteins/pipeline_interchange.py"><code>pipeline_interchange.py</code></a>).</li>
 <li><strong>Lean parity tests</strong> — Python scalars match Lean anchors (e.g. long-range hydrogen-bond proxy, collective modes); see <code>tests/</code>.</li>
 </ul>
 <h2 id="quick-install">Quick install<a class="headerlink" href="#quick-install" title="Permanent link">&para;</a></h2>
@@ -1091,6 +1094,7 @@
 <p>Docker and TPU-oriented images are described in <a href="installation/">Installation</a>.</p>
 <h2 id="citation">Citation<a class="headerlink" href="#citation" title="Permanent link">&para;</a></h2>
 <p>HQIV framework (academic request in LICENSE): <a href="https://doi.org/10.5281/zenodo.18794889">Zenodo record</a>.</p>
+<p>Paper / preprint PDF: available in the <a href="https://github.com/disregardfiat/hqiv-lean">hqiv-lean</a> GitHub repo (DOI pending on hal.science).</p>
 <h2 id="navigation">Navigation<a class="headerlink" href="#navigation" title="Permanent link">&para;</a></h2>
 <p>Use the tabs above for theory (with links into <strong>hqiv-lean</strong>), API docs, benchmarks, the Streamlit live demo, and contributing guidelines.</p>
 
