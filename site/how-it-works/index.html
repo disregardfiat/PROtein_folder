@@ -1083,6 +1083,7 @@
 <li><strong>Co-translational path</strong> — ribosome tunnel masking, segment scheduling, extrusion, then post-tunnel refinement (<code>co_translational_tunnel.py</code>, <code>lean_ribosome_tunnel_pipeline.py</code>).</li>
 <li><strong>Hierarchical / JAX</strong> — optional tree-structured minimization for large chains (<code>hierarchical/</code>).</li>
 <li><strong>Assembly</strong> — multi-chain docking after per-chain folds (<code>assembly_dock.py</code>).</li>
+<li><strong>OSHoracle sparse refinement (optional)</strong> — sparse support is expanded horizon-causally (<code>i -&gt; i and i+1</code>), gate-evolved in a dense reconstruction, then only changed-support residues are updated in CA minimization (<code>osh_oracle_folding.py</code>, <code>pipeline_interchange.py</code>).</li>
 </ol>
 <h2 id="lean-parity">Lean parity<a class="headerlink" href="#lean-parity" title="Permanent link">&para;</a></h2>
 <p>Tests under <code>tests/test_*lean*</code> and <code>tests/test_collective_*.py</code> assert numeric agreement with Lean-exported anchors (e.g. <code>phi_of_shell</code>, hydrogen-bond proxy coefficients). This is the <strong>regression bridge</strong> between <strong>hqiv-lean</strong> and this engine.</p>

@@ -991,6 +991,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#9-whip-stepwise-ab-vs-experimental-crambin-1crn" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        9. WHIP stepwise A/B vs experimental crambin (1CRN)
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -1268,6 +1279,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#9-whip-stepwise-ab-vs-experimental-crambin-1crn" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        9. WHIP stepwise A/B vs experimental crambin (1CRN)
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -1496,6 +1518,16 @@
 <p><strong>Short Metropolis anneal (Lean post-extrusion, <code>em_treetorque</code> mode):</strong> After 3D EM-field relaxation, you can replace the single discrete tree-torque pass with a <strong>short cool-down</strong> at several temperatures (high → <code>temperature_k</code>) using true Metropolis acceptance on the discrete moves. In Python this is <code>post_extrusion_anneal=True</code> on <code>fold_lean_ribosome_tunnel</code> / <code>minimize_full_chain</code>; optional <code>post_extrusion_anneal_schedule_k</code> is a tuple of Kelvin values (≥2). On the server, set <code>CASP_LEAN_POST_ANNEAL=1</code> and optionally <code>CASP_LEAN_POST_ANNEAL_SCHEDULE=348,330,318,310</code> (comma-separated). Any optional Langevin tail uses the <strong>last</strong> schedule temperature as its thermal scale.</p>
 <p><strong>Grading, not just timing:</strong> <code>scripts/validate_casp_lean_pipeline.py</code> reports <strong>wall time</strong>, <strong>PDB sanity</strong>, and <strong>scalar metrics</strong> from the minimizer result (<code>E_ca_final</code>, <code>E_backbone_final</code>, Cα <strong>Rg</strong>). For structure quality vs an experiment or CASP model, pass <strong><code>--grade-ref path/to/ref.pdb</code></strong> or set <strong><code>VALIDATE_LEAN_REF_PDB</code></strong>; the script writes the prediction to a temp file and prints <strong>Cα-RMSD</strong> (Kabsch, order-aligned with trim to min length — use a reference that matches the folded sequence order). For full control (residue-ID alignment, chain selection), call <code>horizon_physics.proteins.grade_folds.ca_rmsd</code> directly.</p>
 <p><strong>In-tunnel thermal gradient (aligned with post-extrusion Langevin):</strong> After each binary-tree segment’s masked L-BFGS pass, you can run <strong>kT-scaled noisy gradient descent</strong> on that segment using the <strong>same</strong> <code>grad_func</code> and <strong>same</strong> cone / lip / <code>hke_above_tunnel_fraction</code> masking as the L-BFGS step (<code>tunnel_thermal_gradient_relax_segment</code> in <code>co_translational_tunnel.py</code>). The thermal scale is <strong><code>refinement_temperature_k</code></strong> / body <strong><code>temperature_k</code></strong> on the Lean path. Python: <code>tunnel_thermal_gradient_steps</code> on <code>minimize_full_chain</code> / <code>fold_lean_ribosome_tunnel</code>. Server: <strong><code>CASP_LEAN_TUNNEL_THERMAL_STEPS</code></strong>, <strong><code>CASP_LEAN_TUNNEL_THERMAL_NOISE_FRAC</code></strong>, optional <strong><code>CASP_LEAN_TUNNEL_THERMAL_SEED</code></strong>. Default <strong>0</strong> preserves the old deterministic tunnel. <strong><code>quick=True</code></strong> caps per-segment thermal steps at <strong>12</strong> to bound cost.</p>
+<hr />
+<h3 id="9-whip-stepwise-ab-vs-experimental-crambin-1crn">9. WHIP stepwise A/B vs experimental crambin (1CRN)<a class="headerlink" href="#9-whip-stepwise-ab-vs-experimental-crambin-1crn" title="Permanent link">&para;</a></h3>
+<p>To compare <strong>force-carrier (WHIP)</strong> translation knobs on <strong>equal footing</strong>, use <strong><code>scripts/crambin_stepwise_side_by_side.py</code></strong>: it builds <strong>one shared</strong> tunnel snapshot, then runs several variants (sqrt vs resonant, EM field direction refresh on/off, barrier/leak settings) with identical gradient steps and bond projection. Output JSON includes per-step <strong>gap vs native long-range pairs</strong>, optional subsampled <strong>Cα-RMSD</strong> vs <code>proteins/1CRN.pdb</code>, and <strong>large-translation events</strong> (displacement threshold + pair-distance drop). Example:</p>
+<p><code>python3 scripts/crambin_stepwise_side_by_side.py --out .casp_grade_outputs/iter_small/crambin_stepwise_side_by_side.json</code> (default <strong>1000</strong> translation steps per variant; override with <code>--max-steps</code>.)</p>
+<p>For a fast smoke test: <code>--quick-snapshot --max-steps 15 --rmsd-every 0</code>.</p>
+<p><strong>Run until motion stalls</strong> (instead of a fixed step budget): <code>--until-still --safety-max-steps 30000 --record-every 25</code> stops when scaled carrier motion stays below <code>--motion-floor</code> for <code>--still-patience</code> consecutive steps, or when <code>||grad|| &lt; --grad-tol</code>, or at the safety cap. Each result includes <strong><code>fold_analysis</code></strong>: Cα clash count, Ramachandran distance to alpha/beta basins vs 1CRN, <strong>missed native contacts</strong> (pairs &lt;7.5 Å in the reference but opened in the prediction), <strong>spurious tight long-range</strong> pairs, <strong><code>tuning_hints</code></strong> for pruning bad geometry, and <strong><code>n_translation_steps</code></strong> (every WHIP iteration counts as one translation).</p>
+<p><strong><code>stepwise_diagnostics</code></strong> (always): summarizes the <strong>translation timeline</strong> — best mean native-pair gap step, first rebound after that optimum, RMSD sample extrema, per tracked pair the step closest to native, and short <strong>narrative</strong> hints. When the run ends on a <strong>step cap</strong>, use this plus <strong><code>records</code></strong> to see <em>where</em> progress toward gold stalled or reversed, then tune WHIP / long-range / refine stages accordingly.</p>
+<p>The built-in variant panel uses <strong>larger <code>carrier_step</code> / <code>carrier_span</code></strong>, a higher <strong><code>wave_leak_floor</code></strong>, and slightly higher <strong><code>linear_gain</code></strong> / barrier drive so terminus-emitted carrier waves <strong>propagate farther and bend the chain faster</strong>. A small <strong><code>collective_kink_weight</code></strong> on <code>grad_full</code> (HQIV Cα kink budget toward the default helix reference) helps keep those stronger waves from drifting into <strong>unphysical</strong> local kink geometry; tune weights if RMSD improves but Ramachandran or clash metrics degrade.</p>
+<p>Selection policy: by default (<code>--variants all</code>) the script runs the <strong>admissible subset</strong> aligned with Lean <code>ProteinVariantSelection</code> (clash-safe, Ramachandran-clean). Other variants are still defined and can be run explicitly via <code>--variants &lt;name1,name2,...&gt;</code> for diagnostics.</p>
+<p><strong>WHIP / force-carrier EM direction refresh (production minimizer):</strong> when <code>ensemble_translation_mix_alpha &gt; 0</code>, <code>_minimize_bonds_fast</code> and the co-translational tunnel passes rebuild the EM-augmented translation direction set whenever a <strong>nonlocal</strong> Cα pair (sequence separation ≥ <code>ensemble_em_refresh_min_seq_sep</code>, default 3) crosses <strong>into</strong> the horizon sphere of radius <strong><code>ensemble_em_refresh_horizon_ang</code></strong> (default <strong>15 Å</strong>, same as <code>folding_energy.R_HORIZON</code> / <code>grad_horizon_full</code>). Counting uses <code>folding_energy.count_nonlocal_pairs_entering_horizon</code>. If <strong><code>ensemble_em_refresh_on_horizon_leaving</code></strong> is True, a symmetric <strong><code>count_nonlocal_pairs_leaving_horizon</code></strong> trigger also rebuilds the set when a pair moves <strong>out</strong> of that radius (horizon coupling drops off). Optional <strong><code>ensemble_em_refresh_on_large_disp</code></strong> restores the older displacement-based trigger. Tunables live on <code>minimize_full_chain</code> (<code>ensemble_em_refresh_*</code>).</p>
 
 
 
