@@ -2539,7 +2539,23 @@ IMAGE_CREDIT = "Image credit: Grok (from the provided picture)"
 def _commodore_html_page(*, title: str, text: str) -> str:
     """Simple green-on-black HTML wrapper; preserves the plain-text vibe."""
     safe_title = _html.escape(str(title))
-    safe_text = _html.escape(str(text))
+    raw_text = str(text)
+    # Linkify plain URLs so the homepage stays clickable while remaining
+    # in a "plain text vibe" (<pre>).
+    import re as _re
+
+    url_re = _re.compile(r"(https?://[^\\s<]+)")
+    parts: list[str] = []
+    last = 0
+    for m in url_re.finditer(raw_text):
+        a, b = int(m.start()), int(m.end())
+        parts.append(_html.escape(raw_text[last:a]))
+        url = raw_text[a:b]
+        safe_url = _html.escape(url, quote=True)
+        parts.append(f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer">{_html.escape(url)}</a>')
+        last = b
+    parts.append(_html.escape(raw_text[last:]))
+    safe_text = "".join(parts)
     safe_img = _html.escape(IMAGE_SRC, quote=True)
     safe_alt = _html.escape("HQIV sparse pi-phase gate map")
     safe_credit = _html.escape(IMAGE_CREDIT)
@@ -2641,11 +2657,12 @@ Prediction algorithm (default: HQIV Lean ribosome tunnel + bulk solvent)
 1) Initial fold (default)
    Single chain: co-translational ribosome tunnel with Lean-aligned ε_r(T), pH
    screening, dihedral bias toward the HQIV α basin, post-extrusion EM + tree-torque,
-   then (by default) an HQIV-native sparse OSHoracle π-phase gate refine on Cα
-   (Lean ``OSHoracleHQIVNative``; disable with CASP_LEAN_OSH_HQIV_NATIVE=0); optional
-   Sparse gate map: causal expand (i->i and i+1), dense harmonic reconstruction,
-   HQIV-native pi-phase pivot, detect flipped support, prune to flipped indices
-   before CA update.
+   then (by default) an HQIV-native sparse OSHoracle quantum pi-phase gate refine on Cα
+   (Lean ``OSHoracleHQIVNative``; in-code: uses the HQIV-native phase pivot); optional
+   Quantum gate map (HQIV/Lean OSHoracle): causal expand (i->i and i+1), dense harmonic
+   reconstruction on the harmonic ladder, HQIV-native pi-phase pivot, detect flipped support,
+   then prune to flipped indices before CA update (only those active residues drive the
+   coordinate step).
    ligands as 6-DOF rigid bodies (included in the tunnel fold for single chain).
    Multi-chain: each chain folded the same way, merged with a chain–chain offset; ligands
    (if provided) are refined against the **entire** merged complex backbone with the same
