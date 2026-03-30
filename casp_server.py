@@ -59,7 +59,8 @@ from email.mime.base import MIMEBase
 from email import encoders
 from email.utils import formataddr, make_msgid, formatdate
 
-from flask import Flask, request, Response
+from flask import Flask, request, Response, send_file
+import html as _html
 
 # src layout: package lives under ./src (editable install also works)
 _root = os.path.dirname(os.path.abspath(__file__))
@@ -2531,6 +2532,80 @@ REPO_URL = "https://github.com/disregardfiat/protein_folder"
 PYHQIV_URL = "https://pypi.org/project/pyhqiv/"
 PAPER_DOI_URL = "https://zenodo.org/records/18794890"
 
+IMAGE_SRC = "/assets/images/Uu9Hk.jpg"
+IMAGE_CREDIT = "Image credit: Grok (from the provided picture)"
+
+
+def _commodore_html_page(*, title: str, text: str) -> str:
+    """Simple green-on-black HTML wrapper; preserves the plain-text vibe."""
+    safe_title = _html.escape(str(title))
+    safe_text = _html.escape(str(text))
+    safe_img = _html.escape(IMAGE_SRC, quote=True)
+    safe_alt = _html.escape("HQIV sparse pi-phase gate map")
+    safe_credit = _html.escape(IMAGE_CREDIT)
+    return f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{safe_title}</title>
+    <style>
+      :root {{ color-scheme: dark; }}
+      body {{
+        margin: 0;
+        padding: 18px 20px;
+        background: #000;
+        color: #00ff00;
+        font-family: "Courier New", Courier, monospace;
+      }}
+      pre {{
+        white-space: pre-wrap;
+        word-wrap: break-word;
+        margin: 0;
+        padding: 0;
+        font-size: 14px;
+        line-height: 1.35;
+      }}
+      .imgwrap {{
+        margin: 0 0 12px 0;
+      }}
+      img {{
+        max-width: 100%;
+        height: auto;
+        border: 1px solid #003300;
+        image-rendering: pixelated;
+      }}
+      .credit {{
+        margin-top: 6px;
+        font-size: 12px;
+        opacity: 0.95;
+      }}
+    </style>
+  </head>
+  <body>
+    <div class="imgwrap">
+      <img src="{safe_img}" alt="{safe_alt}" />
+      <div class="credit">{safe_credit}</div>
+    </div>
+    <pre>{safe_text}</pre>
+  </body>
+</html>
+"""
+
+
+@app.route("/assets/images/<path:filename>", methods=["GET"])
+def serve_asset_image(filename: str):
+    safe = os.path.basename(filename)
+    allowed = {"Uu9Hk.jpg", "favicon.png"}
+    if safe not in allowed:
+        return Response("Not found\n", status=404, mimetype="text/plain")
+    ext = os.path.splitext(safe)[1].lower()
+    mimetype = "image/jpeg" if ext in (".jpg", ".jpeg") else "image/png"
+    asset_path = os.path.join(_root, "site", "assets", "images", safe)
+    if not os.path.isfile(asset_path):
+        return Response("Not found\n", status=404, mimetype="text/plain")
+    return send_file(asset_path, mimetype=mimetype, conditional=True)
+
 
 @app.route("/help", methods=["GET"])
 def help_page():
@@ -2553,8 +2628,11 @@ References:
   Repository:  {REPO_URL}
   pyhqiv:      {PYHQIV_URL}
   Paper (DOI): {PAPER_DOI_URL}
+  Lean proofs (hqiv-lean): https://github.com/disregardfiat/hqiv-lean
+  Paper PDF (GitHub): see hqiv-lean repo (DOI pending on hal.science).
 """
-    return Response(body, status=200, mimetype="text/plain")
+    html = _commodore_html_page(title="HQIV CASP prediction server (help)", text=body)
+    return Response(html, status=200, mimetype="text/html; charset=utf-8")
 
 
 ALGORITHM_DESCRIPTION = r"""
@@ -2565,6 +2643,9 @@ Prediction algorithm (default: HQIV Lean ribosome tunnel + bulk solvent)
    screening, dihedral bias toward the HQIV α basin, post-extrusion EM + tree-torque,
    then (by default) an HQIV-native sparse OSHoracle π-phase gate refine on Cα
    (Lean ``OSHoracleHQIVNative``; disable with CASP_LEAN_OSH_HQIV_NATIVE=0); optional
+   Sparse gate map: causal expand (i->i and i+1), dense harmonic reconstruction,
+   HQIV-native pi-phase pivot, detect flipped support, prune to flipped indices
+   before CA update.
    ligands as 6-DOF rigid bodies (included in the tunnel fold for single chain).
    Multi-chain: each chain folded the same way, merged with a chain–chain offset; ligands
    (if provided) are refined against the **entire** merged complex backbone with the same
@@ -2616,11 +2697,14 @@ def index():
   Repository:  {REPO_URL}
   pyhqiv:      {PYHQIV_URL}
   Paper (DOI): {PAPER_DOI_URL}
+  Lean proofs (hqiv-lean): https://github.com/disregardfiat/hqiv-lean
+  Paper PDF (GitHub): see hqiv-lean repo (DOI pending on hal.science).
 
   POST / or /predict with sequence(s); GET /help for API details.
 {ALGORITHM_DESCRIPTION}
 """
-    return Response(body, status=200, mimetype="text/plain")
+    html = _commodore_html_page(title="HQIV CASP server", text=body)
+    return Response(html, status=200, mimetype="text/html; charset=utf-8")
 
 
 # On startup, run pending jobs once in background (retry or send failure email after MAX_ATTEMPTS)
